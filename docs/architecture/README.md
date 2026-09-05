@@ -110,3 +110,5 @@ Decisions with real alternatives are recorded in [`docs/decisions`](../decisions
 - [0002 — PostgreSQL is the queue; Redis is deferred](../decisions/0002-postgresql-is-the-queue.md)
 - [0003 — Execute tasks as Kubernetes Jobs, not raw Pods](../decisions/0003-kubernetes-jobs-not-pods.md)
 - [0004 — Standard-library `net/http`, zero third-party dependencies](../decisions/0004-standard-library-http.md)
+- [0005 — The store owns every state transition](../decisions/0005-store-owns-transitions.md)
+- [0006 — Readiness is a predicate, not a state](../decisions/0006-readiness-is-derived.md)

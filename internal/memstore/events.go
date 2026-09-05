@@ -111,7 +111,11 @@ func (s *Store) JobEvents(ctx context.Context, jobID string, afterSeq uint64, li
 	page.OldestSeq = oldest
 	// The caller asked to resume from a point this ring has already evicted.
 	// Saying so beats returning a plausible-looking page with a hole in it.
-	page.Truncated = afterSeq+1 < oldest
+	//
+	// Written as a subtraction rather than afterSeq+1 < oldest: Seq is uint64,
+	// so an absurd cursor would wrap to zero and report a gap on a timeline
+	// that has none.
+	page.Truncated = oldest > 1 && afterSeq < oldest-1
 
 	for i := range ring.len() {
 		e := ring.at(i)

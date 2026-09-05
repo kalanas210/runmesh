@@ -159,24 +159,6 @@ func (s *Store) Finish(ctx context.Context, o runmesh.Outcome) error {
 	}
 	s.appendEventLocked(j, e)
 
-	// Fail-fast and operator cancel are ONE mechanism with two triggers. A
-	// terminal step failure under FailFast raises the same cancel flag an
-	// operator would, so sibling steps stop through exactly the same path —
-	// one implementation, one set of tests, and no separate fail-fast
-	// propagation machinery to get subtly wrong.
-	if j.OnStepFailure == runmesh.FailFast && j.CancelRequestedAt == nil &&
-		(to == runmesh.Failed || to == runmesh.TimedOut) {
-		at := ended
-		j.CancelRequestedAt = &at
-		j.CancelReason = runmesh.CancelStepFailed
-		s.appendEventLocked(j, runmesh.Event{
-			Type:  runmesh.JobCancelRequested,
-			At:    ended,
-			State: j.State,
-			Attrs: map[string]any{"reason": string(runmesh.CancelStepFailed), "step_id": step.ID},
-		})
-	}
-
 	s.reconcileJobLocked(j, ended)
 	defer s.signalReady()
 	return nil
@@ -341,6 +323,40 @@ func (s *Store) ExpireLeases(ctx context.Context, now time.Time, limit int) ([]r
 //
 // The caller must hold s.mu.
 func (s *Store) reconcileJobLocked(j *runmesh.Job, now time.Time) {
+	// Fail-fast and operator cancel are ONE mechanism with two triggers: a
+	// terminal step failure under FailFast raises the same cancel flag an
+	// operator would, and sibling steps then stop through exactly the same
+	// path.
+	//
+	// This lives HERE, and not in Finish, because Finish is not the only writer
+	// that can produce a terminal step failure — ExpireLeases does too, when a
+	// dead worker's step exhausts its retry budget. Putting the trigger in one
+	// call site left that path without it: the step went FAILED, no cancel flag
+	// was raised, markDoomed never ran because the policy was not
+	// ContinueOnFailure, and the dependents sat QUEUED for ever while the job
+	// stayed RUNNING. Making it a property of the transition rather than of the
+	// caller means every present and future writer inherits it.
+	if j.OnStepFailure == runmesh.FailFast && j.CancelRequestedAt == nil {
+		for _, step := range j.Steps {
+			if step.State != runmesh.Failed && step.State != runmesh.TimedOut {
+				continue
+			}
+			at := now
+			j.CancelRequestedAt = &at
+			j.CancelReason = runmesh.CancelStepFailed
+			s.appendEventLocked(j, runmesh.Event{
+				Type:  runmesh.JobCancelRequested,
+				At:    now,
+				State: j.State,
+				Attrs: map[string]any{
+					"reason":  string(runmesh.CancelStepFailed),
+					"step_id": step.ID,
+				},
+			})
+			break
+		}
+	}
+
 	// A cancel-flagged job cancels everything that has not started. Steps a
 	// worker owns are left alone: they learn through their next heartbeat, and
 	// reaching in here would be the zombie-overwrite the fencing token exists

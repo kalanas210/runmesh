@@ -1158,3 +1158,160 @@ func itoa(n int) string {
 	}
 	return string(buf[i:])
 }
+
+// ---------------------------------------------------- review regressions
+
+// heartbeatSpy counts heartbeats so a test can wait until the worker has
+// actually CONSUMED a tick.
+//
+// Advancing a fake clock only delivers the tick; the worker processes it on its
+// own goroutine afterwards. Waiting on the waiter count cannot see the
+// difference here, because the count is the same before and after (the step
+// deadline is replaced by the abandon timer). Waiting for heartbeat N+1 to be
+// entered is what proves heartbeat N was fully processed, since both run on the
+// same goroutine in order.
+type heartbeatSpy struct {
+	engine.Store
+	entered chan struct{}
+}
+
+func (h *heartbeatSpy) Heartbeat(ctx context.Context, l runmesh.Lease, now, until time.Time) (runmesh.Directive, error) {
+	select {
+	case h.entered <- struct{}{}:
+	default:
+	}
+	return h.Store.Heartbeat(ctx, l, now, until)
+}
+
+func (h *heartbeatSpy) waitBeats(t *testing.T, n int) {
+	t.Helper()
+	for range n {
+		select {
+		case <-h.entered:
+		case <-t.Context().Done():
+			t.Fatalf("only saw fewer than %d heartbeats", n)
+		}
+	}
+}
+
+// TestAbandonTimerIsNotRearmedByHeartbeats is the regression for the worst bug
+// an adversarial review of Week 1 found.
+//
+// The cancel flag is sticky, so every heartbeat after a cancellation reports the
+// same cancellation. The abandon timer was re-armed on each of those, and with
+// the shipped defaults (heartbeat 5s, grace 10s) it was therefore reset five
+// seconds before it could ever fire. A tool ignoring its context held a worker
+// for the life of the process, the job never terminalised, and every shutdown
+// ended in ErrDrainIncomplete.
+func TestAbandonTimerIsNotRearmedByHeartbeats(t *testing.T) {
+	t.Parallel()
+	g := newGate(true) // deliberately ignores cancellation
+	h := newHarness(t, tools.Registry{"gate": g, "echo": tools.Echo{}})
+
+	spy := &heartbeatSpy{Store: h.store, entered: make(chan struct{}, 64)}
+	eng, err := engine.New(engine.Config{
+		Owner: "test", Workers: 1, ClaimBatch: 1,
+		PollInterval:      time.Hour, // only the readiness hint drives claiming here
+		LeaseTTL:          30 * time.Second,
+		HeartbeatInterval: time.Second,
+		StoreTimeout:      time.Second,
+		AbandonGrace:      5 * time.Second,
+		ReconcileInterval: time.Hour,
+		ReconcileBatch:    100,
+	}, engine.Deps{
+		Store:    spy,
+		Executor: tools.Local{Registry: h.reg, MaxOutputBytes: 1 << 20, Log: quietLogger()},
+		Clock:    h.clk,
+		Log:      quietLogger(),
+	})
+	if err != nil {
+		t.Fatalf("engine.New: %v", err)
+	}
+
+	h.submit("job_stuck", []runmesh.PlanStep{
+		{ID: "s", Tool: "gate", TimeoutSec: 600, MaxAttempts: 1},
+	}, runmesh.FailFast)
+
+	if err := eng.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	h.await(stepEvent(runmesh.StepStarted, "s"), "the step to start")
+	g.waitEntered(t)
+
+	// reconciler ticker + step deadline + heartbeat ticker.
+	if err := h.clk.BlockUntilContext(t.Context(), 3); err != nil {
+		t.Fatalf("waiting for the step to park: %v", err)
+	}
+	if _, err := h.store.RequestCancel(t.Context(), "job_stuck", runmesh.CancelUser, h.clk.Now()); err != nil {
+		t.Fatalf("RequestCancel: %v", err)
+	}
+
+	// t=1s: the first heartbeat delivers the cancellation and arms the grace,
+	// which is therefore due at t=6s.
+	h.clk.Advance(time.Second)
+	spy.waitBeats(t, 1)
+
+	// t=2s: a second heartbeat. Waiting for it to be ENTERED proves the first
+	// was fully processed, so the grace is armed and its deadline is fixed.
+	// This is the heartbeat that used to push that deadline out.
+	h.clk.Advance(time.Second)
+	spy.waitBeats(t, 1)
+
+	// Cross the grace. Several more heartbeats fire on the way, and none of
+	// them may move the deadline.
+	h.clk.Advance(5 * time.Second)
+
+	h.await(jobFinished, "the abandoned step to settle despite repeated heartbeats")
+
+	j := h.job("job_stuck")
+	if !j.State.Terminal() {
+		t.Fatalf("job state = %s; a tool ignoring its context must not hold a job open", j.State)
+	}
+	if got := j.Step("s").State; got != runmesh.Cancelled {
+		t.Errorf("step state = %s, want CANCELLED", got)
+	}
+	if got := j.Step("s").Failures; got != 0 {
+		t.Errorf("abandoning a cancelled step spent %d units of retry budget, want 0", got)
+	}
+
+	close(g.release)
+	_ = eng.Shutdown(t.Context())
+}
+
+// TestTimeoutIsNotMisreadAsAContractViolation is the regression for a select
+// race: when the step deadline fires and the tool returns at the same instant,
+// Go picks a ready case at random. If it took the result first, `stop` was
+// still StopNone and the tool's own context error was classified as
+// tool_broke_contract — a terminal failure for what was really a timeout, and
+// so never retried.
+//
+// It is asserted through Classify directly, because reproducing the race
+// itself would be exactly the flaky test this codebase avoids: the fix is that
+// the worker resolves the stop reason from the context state before consuming
+// the result, and Classify's behaviour for each resolved reason is what has to
+// hold.
+func TestTimeoutIsNotMisreadAsAContractViolation(t *testing.T) {
+	t.Parallel()
+	b := engine.Backoff{Base: time.Second, Max: time.Minute, Factor: 2}
+
+	// What the worker used to do: consume the result with stop unresolved.
+	unresolved := engine.Classify(engine.StopNone, context.DeadlineExceeded, 0, 3, b)
+	if unresolved.State != runmesh.Failed || unresolved.Error.Code != runmesh.CodeContractBroken {
+		t.Fatalf("premise changed: an unresolved deadline now classifies as %+v", unresolved)
+	}
+
+	// What it does now: resolve the reason first, then classify.
+	resolved := engine.Classify(engine.StopTimeout, context.DeadlineExceeded, 0, 3, b)
+	if resolved.State != runmesh.Retrying {
+		t.Errorf("a resolved timeout = %s, want RETRYING", resolved.State)
+	}
+	if resolved.Error.Code != runmesh.CodeTimeout {
+		t.Errorf("a resolved timeout reports %q, want %q", resolved.Error.Code, runmesh.CodeTimeout)
+	}
+
+	// The same applies to a drain: it must release, not fail.
+	drained := engine.Classify(engine.StopShutdown, context.Canceled, 0, 3, b)
+	if !drained.Release || drained.CountFail {
+		t.Errorf("a resolved drain = %+v, want a release that spends no budget", drained)
+	}
+}

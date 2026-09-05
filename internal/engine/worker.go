@@ -92,9 +92,42 @@ func (e *Engine) execute(hard context.Context, log *slog.Logger, l runmesh.Lease
 	var reason runmesh.CancelReason
 	var abandon <-chan time.Time
 
+	// armAbandon starts the clock on a tool that has been told to stop. It is
+	// idempotent BY DESIGN: the cancel flag is sticky, so every subsequent
+	// heartbeat reports the same cancellation, and re-arming here would push
+	// the deadline out by one heartbeat interval every heartbeat interval. With
+	// the shipped defaults (heartbeat 5s, grace 10s) that timer would never
+	// fire at all, and a tool ignoring its context would hold a worker for the
+	// life of the process.
+	armAbandon := func() {
+		if abandon == nil {
+			abandon = e.clock.After(e.cfg.AbandonGrace)
+		}
+	}
+
+	// resolveStop names the reason a step stopped when the context ended but
+	// no branch has recorded why yet. It asks the PARENT, never runCtx.Err():
+	// the step deadline and the drain deadline are different contexts, and
+	// confusing them turns a deploy into a wave of spurious timeouts that each
+	// burn a retry.
+	resolveStop := func() Stop {
+		if hard.Err() != nil {
+			return StopShutdown
+		}
+		return StopTimeout
+	}
+
 	for {
 		select {
 		case r := <-done:
+			// A ready select case is chosen at random, so the deadline firing
+			// and the tool returning at the same instant can hand us the result
+			// before the <-expired branch ever runs. Without this, a step that
+			// genuinely timed out would be classified from the tool's own
+			// context error as tool_broke_contract, and never retried.
+			if stop == StopNone && runCtx.Err() != nil {
+				stop = resolveStop()
+			}
 			e.settle(hard, log, l, stop, reason, r, started)
 			return
 
@@ -105,17 +138,21 @@ func (e *Engine) execute(hard context.Context, log *slog.Logger, l runmesh.Lease
 			hcancel()
 			switch {
 			case errors.Is(err, runmesh.ErrLeaseLost), errors.Is(err, runmesh.ErrConflict):
-				// ORDER MATTERS: stop is assigned before cancel() is called, so
-				// the classifier can never see a cancelled context without
-				// knowing why it was cancelled.
+				// Losing the lease overrides any earlier reason: somebody else
+				// owns this step now, so whatever we were about to write is
+				// void. ORDER MATTERS — stop is assigned before cancel() is
+				// called, so the classifier can never see a cancelled context
+				// without knowing why it was cancelled.
 				stop = StopLost
-				hbC = nil
-				abandon = e.clock.After(e.cfg.AbandonGrace)
+				hbC = nil // stop renewing a lease we do not own
+				armAbandon()
 				log.Warn("lease lost; abandoning this attempt", "err", err)
 				cancel()
-			case err == nil && dir.Cancel:
+			case err == nil && dir.Cancel && stop == StopNone:
+				// Only the FIRST cancellation decides anything. Renewal keeps
+				// running so the lease is held while the grace elapses.
 				stop, reason = StopCancel, dir.Reason
-				abandon = e.clock.After(e.cfg.AbandonGrace)
+				armAbandon()
 				log.Info("cancellation received", "reason", string(dir.Reason))
 				cancel()
 			case err != nil:
@@ -125,19 +162,11 @@ func (e *Engine) execute(hard context.Context, log *slog.Logger, l runmesh.Lease
 			}
 
 		case <-expired:
-			expired = nil
+			expired = nil // a closed channel is always ready: fire this once
 			if stop == StopNone {
-				// Disambiguate by asking the PARENT, never runCtx.Err(). The
-				// step deadline and the drain deadline are different contexts,
-				// and confusing them turns a deploy into a wave of spurious
-				// timeouts that each burn a retry.
-				if hard.Err() != nil {
-					stop = StopShutdown
-				} else {
-					stop = StopTimeout
-				}
-				abandon = e.clock.After(e.cfg.AbandonGrace)
+				stop = resolveStop()
 			}
+			armAbandon()
 
 		case <-abandon:
 			// The tool is ignoring its context. We settle without it and let

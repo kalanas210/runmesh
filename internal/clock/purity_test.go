@@ -5,6 +5,7 @@ import (
 	"go/parser"
 	"go/token"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -32,6 +33,7 @@ var banned = map[string]map[string]string{
 		"NewTicker": "use Clock.NewTicker",
 		"AfterFunc": "use Clock.After and a select",
 		"Since":     "use Clock.Since",
+		"Until":     "use Clock.Now and subtract",
 	},
 	"context": {
 		"WithTimeout":       "use Clock.WithTimeout or clock.WithWriteDeadline",
@@ -99,9 +101,10 @@ func checkFile(t *testing.T, root, path string) {
 		return
 	}
 
-	// Only flag a package name the file actually imports under that name, so a
-	// local variable called `time` cannot produce a false positive.
-	imported := importedNames(file)
+	// Map each local name to the package it actually refers to, so a local
+	// variable called `time` cannot produce a false positive AND an alias like
+	// `import t "time"` cannot slip past.
+	imported := importedNames(t, rel(root, path), file)
 
 	allowed := map[int]bool{}
 	for _, group := range file.Comments {
@@ -117,11 +120,17 @@ func checkFile(t *testing.T, root, path string) {
 		if !ok {
 			return true
 		}
-		pkg, ok := sel.X.(*ast.Ident)
-		if !ok || pkg.Obj != nil || !imported[pkg.Name] {
-			return true // shadowed by a local declaration, or not that import
+		local, ok := sel.X.(*ast.Ident)
+		if !ok || local.Obj != nil {
+			return true // shadowed by a local declaration, not a package name
 		}
-		reason, bad := banned[pkg.Name][sel.Sel.Name]
+		// Resolve through the alias: `import t "time"` must be checked against
+		// the rules for "time", not for "t".
+		pkg, imported := imported[local.Name]
+		if !imported {
+			return true
+		}
+		reason, bad := banned[pkg][sel.Sel.Name]
 		if !bad {
 			return true
 		}
@@ -129,17 +138,23 @@ func checkFile(t *testing.T, root, path string) {
 		if allowed[pos.Line] {
 			return true
 		}
-		t.Errorf("%s:%d: %s.%s is banned outside internal/clock — %s\n"+
+		t.Errorf("%s:%d: %s.%s (%s.%s) is banned outside internal/clock — %s\n"+
 			"\t(if this use is genuinely correct, add a `// %s: <reason>` comment on that line)",
-			rel(root, path), pos.Line, pkg.Name, sel.Sel.Name, reason, allowMarker)
+			rel(root, path), pos.Line, local.Name, sel.Sel.Name, pkg, sel.Sel.Name, reason, allowMarker)
 		return true
 	})
 }
 
-// importedNames returns the local names under which the banned packages are
-// imported by this file.
-func importedNames(file *ast.File) map[string]bool {
-	out := map[string]bool{}
+// importedNames maps the local name of each watched import to its real package
+// path.
+//
+// Keying on the local name alone would let `import t "time"` defeat the entire
+// check, because there are no rules registered under "t". A dot import is
+// rejected outright: it puts Now and Sleep into the file's own scope, where a
+// selector-based walk cannot see them at all.
+func importedNames(t *testing.T, path string, file *ast.File) map[string]string {
+	t.Helper()
+	out := map[string]string{}
 	for _, imp := range file.Imports {
 		p := strings.Trim(imp.Path.Value, `"`)
 		if _, watched := banned[p]; !watched {
@@ -149,7 +164,14 @@ func importedNames(file *ast.File) map[string]bool {
 		if imp.Name != nil {
 			name = imp.Name.Name
 		}
-		out[name] = true
+		if name == "." {
+			t.Errorf("%s: dot-importing %q hides its identifiers from this check; import it normally", path, p)
+			continue
+		}
+		if name == "_" {
+			continue
+		}
+		out[name] = p
 	}
 	return out
 }
@@ -160,4 +182,77 @@ func rel(root, path string) string {
 		return path
 	}
 	return filepath.ToSlash(r)
+}
+
+// TestPurityCheckActuallyCatchesViolations is the negative fixture.
+//
+// A guard that has never been shown to fail is not a guard. This writes source
+// that violates the rule in each way that has to be caught — including the
+// aliased import that used to slip past, because the check keyed its rules on
+// the local name rather than the package path — and asserts the walk reports
+// every one of them.
+func TestPurityCheckActuallyCatchesViolations(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name    string
+		src     string
+		wantHit bool
+	}{
+		{
+			name:    "plain time.Now",
+			src:     "package x\nimport \"time\"\nfunc f() { _ = time.Now() }\n",
+			wantHit: true,
+		},
+		{
+			name:    "aliased time import",
+			src:     "package x\nimport t \"time\"\nfunc f() { _ = t.Now() }\n",
+			wantHit: true,
+		},
+		{
+			name:    "context.WithTimeout",
+			src:     "package x\nimport (\"context\"\n\"time\")\nfunc f() { _, _ = context.WithTimeout(context.Background(), time.Second) }\n",
+			wantHit: true,
+		},
+		{
+			name:    "aliased context import",
+			src:     "package x\nimport (c \"context\"\n\"time\")\nfunc f() { _, _ = c.WithDeadline(c.Background(), time.Time{}) }\n",
+			wantHit: true,
+		},
+		{
+			// A local variable that happens to be called `time` is not the
+			// package, and must not be reported.
+			name:    "shadowed identifier is not a violation",
+			src:     "package x\ntype s struct{ Now func() int }\nfunc f() { time := s{}; _ = time.Now() }\n",
+			wantHit: false,
+		},
+		{
+			name:    "permitted time constructors",
+			src:     "package x\nimport \"time\"\nfunc f() { _ = time.Second; _ = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC) }\n",
+			wantHit: false,
+		},
+		{
+			name:    "explicit allow marker",
+			src:     "package x\nimport \"time\"\nfunc f() { _ = time.Now() } // clock:allow deliberate\n",
+			wantHit: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			path := filepath.Join(dir, "fixture.go")
+			if err := os.WriteFile(path, []byte(tc.src), 0o600); err != nil {
+				t.Fatalf("write fixture: %v", err)
+			}
+			// checkFile reports through *testing.T, so run it against a probe
+			// and observe whether that probe failed.
+			probe := &testing.T{}
+			checkFile(probe, dir, path)
+			if got := probe.Failed(); got != tc.wantHit {
+				t.Errorf("violation detected = %v, want %v\nsource:\n%s", got, tc.wantHit, tc.src)
+			}
+		})
+	}
 }

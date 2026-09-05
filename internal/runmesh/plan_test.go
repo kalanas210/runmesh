@@ -146,6 +146,21 @@ func TestPlanValidate(t *testing.T) {
 			wantIssues: []string{"out_of_range"},
 		},
 		{
+			// time.Duration(n) * time.Second overflows int64 above roughly 9.2e9
+			// and wraps NEGATIVE, which compares as comfortably under any
+			// ceiling. A step built from it gets a deadline already in the past.
+			name:       "timeout_seconds that overflows a Duration",
+			plan:       runmesh.Plan{Name: "x", Steps: []runmesh.PlanStep{{ID: "a", Tool: "echo", TimeoutSec: 10_000_000_000}}},
+			wantFields: []string{"steps[0].timeout_seconds"},
+			wantIssues: []string{"out_of_range"},
+		},
+		{
+			name:       "timeout_seconds at the far edge of int64",
+			plan:       runmesh.Plan{Name: "x", Steps: []runmesh.PlanStep{{ID: "a", Tool: "echo", TimeoutSec: 9223372036854775807}}},
+			wantFields: []string{"steps[0].timeout_seconds"},
+			wantIssues: []string{"out_of_range"},
+		},
+		{
 			name:       "max_attempts above the ceiling",
 			plan:       runmesh.Plan{Name: "x", Steps: []runmesh.PlanStep{{ID: "a", Tool: "echo", MaxAttempts: 99}}},
 			wantFields: []string{"steps[0].max_attempts"},
@@ -307,5 +322,48 @@ func TestPlanBuildIsPure(t *testing.T) {
 	}
 	if j.Steps[1].DependsOn[0] != "a" {
 		t.Error("Build aliased the plan's depends_on")
+	}
+}
+
+// TestBuildNeverInstallsANegativeDeadline is the regression for an overflow an
+// adversarial review found.
+//
+// Build is exported, so a caller that skipped Validate must still not be able
+// to produce a step whose context is expired the moment it is created — which
+// would time out every attempt instantly until the retry budget was gone.
+func TestBuildNeverInstallsANegativeDeadline(t *testing.T) {
+	t.Parallel()
+	defaults := runmesh.Defaults{StepTimeout: 30 * time.Second, MaxAttempts: 3}
+
+	for _, sec := range []int{
+		10_000_000_000,      // overflows int64 nanoseconds
+		9223372036854775807, // math.MaxInt64
+		1 << 62,
+	} {
+		p := runmesh.Plan{Name: "x", Steps: []runmesh.PlanStep{
+			{ID: "a", Tool: "echo", TimeoutSec: sec},
+		}}
+		// Validation rejects it...
+		if err := p.Validate(known, testLimits); err == nil {
+			t.Errorf("Validate accepted timeout_seconds=%d", sec)
+		}
+		// ...and Build refuses to install it even if validation was skipped.
+		got := p.Build("job_1", testEpoch, defaults).Steps[0].Timeout
+		if got <= 0 {
+			t.Errorf("Build with timeout_seconds=%d produced a %s deadline; a step "+
+				"would be expired before it started", sec, got)
+		}
+		if got != defaults.StepTimeout {
+			t.Errorf("Build with an out-of-range timeout_seconds=%d used %s, want the default %s",
+				sec, got, defaults.StepTimeout)
+		}
+	}
+
+	// A large but legitimate timeout is still honoured.
+	p := runmesh.Plan{Name: "x", Steps: []runmesh.PlanStep{
+		{ID: "a", Tool: "echo", TimeoutSec: 3600},
+	}}
+	if got := p.Build("job_1", testEpoch, defaults).Steps[0].Timeout; got != time.Hour {
+		t.Errorf("a one-hour timeout became %s", got)
 	}
 }

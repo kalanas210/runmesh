@@ -49,6 +49,26 @@ type Defaults struct {
 
 var stepIDRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
 
+// maxBuildTimeout is the absolute ceiling Build honours, independent of
+// configuration. It exists only to make an unvalidated plan safe; the real,
+// operator-configured limit is Limits.MaxStepTimeout, checked in Validate.
+const maxBuildTimeout = 24 * time.Hour
+
+// timeoutInRange bounds the raw integer BEFORE it is converted to a Duration.
+//
+// time.Duration(n) * time.Second overflows int64 for n above roughly 9.2e9 and
+// wraps to a NEGATIVE value, which then compares as comfortably under any
+// ceiling. A step built from it would get a deadline already in the past, its
+// context would be expired the instant it was created, and every attempt would
+// time out immediately until the retry budget was gone — all from a plan that
+// passed validation.
+func timeoutInRange(sec int, max time.Duration) bool {
+	if sec < 0 {
+		return false
+	}
+	return int64(sec) <= int64(max/time.Second)
+}
+
 // Validate is the ONE gate between an untrusted plan and the runtime. It
 // reports every problem it finds rather than stopping at the first, so a 400
 // body tells the caller everything at once — which matters far more when the
@@ -98,7 +118,7 @@ func (p *Plan) Validate(known func(tool string) bool, lim Limits) error {
 		if lim.MaxDependsOn > 0 && len(s.DependsOn) > lim.MaxDependsOn {
 			add(f+".depends_on", "too_many")
 		}
-		if s.TimeoutSec < 0 || time.Duration(s.TimeoutSec)*time.Second > lim.MaxStepTimeout {
+		if !timeoutInRange(s.TimeoutSec, lim.MaxStepTimeout) {
 			add(f+".timeout_seconds", "out_of_range")
 		}
 		if s.MaxAttempts < 0 || s.MaxAttempts > lim.MaxAttempts {
@@ -200,8 +220,11 @@ func (p *Plan) Build(id string, now time.Time, def Defaults) *Job {
 		Steps:         make([]*Step, len(p.Steps)),
 	}
 	for i, ps := range p.Steps {
+		// Guarded again here, not only in Validate: Build is exported, and a
+		// caller that skipped validation must still not be able to install a
+		// negative or wrapped deadline.
 		timeout := def.StepTimeout
-		if ps.TimeoutSec > 0 {
+		if ps.TimeoutSec > 0 && timeoutInRange(ps.TimeoutSec, maxBuildTimeout) {
 			timeout = time.Duration(ps.TimeoutSec) * time.Second
 		}
 		attempts := def.MaxAttempts

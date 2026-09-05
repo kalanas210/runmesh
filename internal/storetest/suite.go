@@ -16,6 +16,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -68,6 +69,10 @@ func RunSuite(t *testing.T, newStore Factory) {
 		{"CancelLeavesLeasedStepsAlone", testCancelLeavesLeasedStepsAlone},
 		{"CancelBlocksClaiming", testCancelBlocksClaiming},
 		{"FailFastCancelsSiblings", testFailFastCancelsSiblings},
+		{"FailFastAppliesToLeaseExpiryToo", testFailFastAppliesToLeaseExpiryToo},
+		{"ReleaseOnACancelledJobDoesNotStrand", testReleaseOnACancelledJobDoesNotStrand},
+		{"SubscribersAreIsolated", testSubscribersAreIsolated},
+		{"AbsurdEventCursorDoesNotReportAFalseGap", testAbsurdEventCursorDoesNotReportAFalseGap},
 		{"ContinueOnFailureDoomsDependents", testContinueOnFailureDoomsDependents},
 		{"RollupPrecedence", testRollupPrecedence},
 		{"EventSequences", testEventSequences},
@@ -1000,4 +1005,170 @@ func itoa(n int) string {
 		n /= 10
 	}
 	return string(buf[i:])
+}
+
+// ------------------------------------------------- review regressions
+
+// testFailFastAppliesToLeaseExpiryToo is the regression for a HIGH-severity
+// bug an adversarial review found: the fail-fast trigger lived in Finish, so a
+// step driven to FAILED by the lease sweep instead — a dead worker exhausting
+// its retry budget — raised no cancel flag and doomed nothing. Its dependents
+// sat QUEUED for ever and the job never reached a terminal state.
+//
+// The fix moved the trigger into the one function every writer ends in, which
+// is exactly the kind of thing this suite exists to hold: a pgstore that
+// re-implements ExpireLeases without it fails here.
+func testFailFastAppliesToLeaseExpiryToo(t *testing.T, s Store) {
+	j := job(t, "job_a", epoch, map[string][]string{"b": {"a"}}, "a", "b")
+	j.Steps[0].MaxAttempts = 1 // one expiry is enough to exhaust it
+	mustCreate(t, s, j)
+
+	// Claim without ever settling: what a killed worker leaves behind.
+	if got := mustClaim(t, s, epoch, 1); len(got) != 1 {
+		t.Fatalf("claimed %d steps, want 1", len(got))
+	}
+
+	expireAt := epoch.Add(leaseTTL + time.Second)
+	expired, err := s.ExpireLeases(t.Context(), expireAt, 10)
+	if err != nil {
+		t.Fatalf("ExpireLeases: %v", err)
+	}
+	if len(expired) != 1 || expired[0].NewState != runmesh.Failed {
+		t.Fatalf("expired = %+v, want the step FAILED with its budget exhausted", expired)
+	}
+
+	if st := stepState(t, s, "job_a", "a"); st != runmesh.Failed {
+		t.Fatalf("step a = %s, want FAILED", st)
+	}
+	if st := stepState(t, s, "job_a", "b"); st != runmesh.Cancelled {
+		t.Errorf("dependent step b = %s, want CANCELLED: a fail-fast job must not "+
+			"leave dependents claimable-never", st)
+	}
+	if st := jobState(t, s, "job_a"); st != runmesh.Failed {
+		t.Fatalf("job state = %s, want FAILED. A job whose step failed via lease "+
+			"expiry must still reach a terminal state", st)
+	}
+	if got := mustClaim(t, s, expireAt, 10); len(got) != 0 {
+		t.Errorf("a terminal job still offered %d claimable steps", len(got))
+	}
+}
+
+// testReleaseOnACancelledJobDoesNotStrand: releasing a step during a drain
+// puts it back in QUEUED, but the claim predicate excludes cancel-flagged
+// jobs — so without the reconcile that follows, the step would sit QUEUED for
+// ever and its job would never become quiescent.
+func testReleaseOnACancelledJobDoesNotStrand(t *testing.T, s Store) {
+	mustCreate(t, s, job(t, "job_a", epoch, nil, "a"))
+
+	l := mustClaim(t, s, epoch, 1)[0]
+	if err := s.Start(t.Context(), l, epoch); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if _, err := s.RequestCancel(t.Context(), "job_a", runmesh.CancelUser, epoch); err != nil {
+		t.Fatalf("RequestCancel: %v", err)
+	}
+
+	// The drain deadline expires and the worker hands the step back.
+	if err := s.Release(t.Context(), l, "shutdown_drain", epoch.Add(time.Second)); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+
+	if st := stepState(t, s, "job_a", "a"); st != runmesh.Cancelled {
+		t.Errorf("released step = %s, want CANCELLED: it can never be claimed again", st)
+	}
+	if st := jobState(t, s, "job_a"); st != runmesh.Cancelled {
+		t.Fatalf("job state = %s, want CANCELLED. A step released onto a cancelled "+
+			"job must not leave it stuck non-terminal", st)
+	}
+}
+
+// testSubscribersAreIsolated: a delivered event must be the subscriber's own
+// copy. An Event is a value, but its Error pointer and Attrs map are not, so a
+// shared one lets a subscriber corrupt the store's own timeline — something a
+// SQL store, which decodes rows per caller, could never reproduce.
+func testSubscribersAreIsolated(t *testing.T, s Store) {
+	first, unsub1 := s.Subscribe(16)
+	defer unsub1()
+	second, unsub2 := s.Subscribe(16)
+	defer unsub2()
+
+	mustCreate(t, s, job(t, "job_a", epoch, nil, "a"))
+	l := mustClaim(t, s, epoch, 1)[0]
+	failStep(t, s, l, epoch, runmesh.Failed)
+
+	// Find a delivered event carrying an error and mutate everything on it.
+	var mutated bool
+	for range 16 {
+		select {
+		case e := <-first:
+			if e.Error == nil {
+				continue
+			}
+			e.Error.Code = "corrupted"
+			e.Error.Message = "corrupted"
+			if e.Attrs != nil {
+				e.Attrs["corrupted"] = true
+			}
+			mutated = true
+		default:
+		}
+		if mutated {
+			break
+		}
+	}
+	if !mutated {
+		t.Skip("no error-carrying event was delivered; nothing to isolate")
+	}
+
+	// The second subscriber's copy must be untouched.
+	for range 16 {
+		select {
+		case e := <-second:
+			if e.Error != nil && e.Error.Code == "corrupted" {
+				t.Fatal("subscribers share one *ErrorInfo; mutating a delivered event " +
+					"reached another subscriber")
+			}
+		default:
+		}
+	}
+	// And so must the store's own timeline.
+	page, err := s.JobEvents(t.Context(), "job_a", 0, 100)
+	if err != nil {
+		t.Fatalf("JobEvents: %v", err)
+	}
+	for _, e := range page.Events {
+		if e.Error != nil && e.Error.Code == "corrupted" {
+			t.Fatal("a subscriber mutating a delivered event corrupted the stored timeline")
+		}
+		if _, bad := e.Attrs["corrupted"]; bad {
+			t.Fatal("a subscriber mutating a delivered event's Attrs corrupted the stored timeline")
+		}
+	}
+}
+
+// testAbsurdEventCursorDoesNotReportAFalseGap: Seq is a uint64, so a cursor of
+// MaxUint64 used to wrap to zero in the truncation check and report a gap on a
+// timeline that has none.
+func testAbsurdEventCursorDoesNotReportAFalseGap(t *testing.T, s Store) {
+	mustCreate(t, s, job(t, "job_a", epoch, nil, "a"))
+
+	page, err := s.JobEvents(t.Context(), "job_a", math.MaxUint64, 10)
+	if err != nil {
+		t.Fatalf("JobEvents: %v", err)
+	}
+	if page.Truncated {
+		t.Error("an out-of-range cursor reported truncated on a timeline with no gap")
+	}
+	if len(page.Events) != 0 {
+		t.Errorf("a cursor past the end returned %d events", len(page.Events))
+	}
+
+	// A cursor of zero on a complete timeline is likewise not truncated.
+	page, err = s.JobEvents(t.Context(), "job_a", 0, 10)
+	if err != nil {
+		t.Fatalf("JobEvents: %v", err)
+	}
+	if page.Truncated {
+		t.Error("a fresh timeline reported truncated")
+	}
 }

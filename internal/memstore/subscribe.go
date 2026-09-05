@@ -63,12 +63,19 @@ func (s *subscribers) add(buf int) (<-chan runmesh.Event, func()) {
 // operation, which is what makes it safe to call while the store's own mutex
 // is held — and holding both is what guarantees subscribers observe events in
 // GlobalSeq order rather than in whatever order goroutines happen to wake.
+//
+// Every delivery is a fresh deep copy. An Event is a value, but its Error
+// pointer and Attrs map are not: without the clone, one subscriber mutating a
+// delivered event would corrupt the store's own event ring and every other
+// subscriber's copy. A SQL-backed store hands back rows it decoded per
+// caller and could never reproduce that, which is exactly the class of
+// divergence this package exists to avoid.
 func (s *subscribers) publish(e runmesh.Event) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for sub := range s.set {
 		select {
-		case sub.ch <- e:
+		case sub.ch <- e.Clone():
 		default:
 			s.dropped.Add(1)
 		}
