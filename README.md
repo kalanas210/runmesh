@@ -30,7 +30,7 @@ User goal ──▶ planner ──▶ validated plan ──▶ RunMesh ──▶
 | **Working now** | HTTP API, step DAG, worker pool, per-step timeouts, cancellation, retries with backoff, leases + reconciler, execution timeline, graceful shutdown |
 | **In memory** | **A restart loses every job.** PostgreSQL arrives in Week 2 |
 | **Dependencies** | **Zero.** `go.mod` has no `require` block |
-| **Tests** | 100% pass under `-race`; coverage 82–91% per package |
+| **Tests** | 116 tests, 230 cases, all green under `-race`; 82–91% coverage per package |
 
 `GET /api/v1/ready` reports `"durable": false`, and the server logs a warning
 at boot. A status endpoint that overstated durability would be worse than no
@@ -303,6 +303,29 @@ exercises a 30-second step timeout finishes in microseconds. Runtime tests
 assert on the **event stream**, which is simultaneously the assertion and the
 synchronisation primitive: one spurious extra attempt fails the test, where a
 final-status check would pass.
+
+### What the review found
+
+The Week-1 code was put through an adversarial review — six independent
+reviewers over the codebase, then three skeptics per finding, each trying to
+*refute* it. Twenty-three findings, thirteen survived. The two that mattered:
+
+- **The abandon timer was re-armed by every heartbeat.** The cancel flag is
+  sticky, so each heartbeat after a cancellation reported the same
+  cancellation and reset the timer. With the *shipped defaults* — heartbeat 5s,
+  grace 10s — it was reset five seconds before it could ever fire, so a tool
+  ignoring its context held a worker for the life of the process and every
+  shutdown ended in `ErrDrainIncomplete`. Its regression test hangs without
+  the fix.
+- **Fail-fast did not apply to lease expiry.** The trigger lived in `Finish`,
+  so a step driven to FAILED by the reconciler instead — a dead worker
+  exhausting its budget — raised no cancel flag. Its dependents sat QUEUED for
+  ever and the job never terminalised. The fix moved it into the one function
+  every writer ends in, so it is a property of the transition rather than of
+  one call site.
+
+Both regressions are in the shared store suite, so the Week-2 PostgreSQL store
+inherits them. Details are in the commit that fixed them.
 
 The highest-value test here is [`internal/storetest`](internal/storetest):
 an **exported conformance suite** the in-memory store must pass today and the
