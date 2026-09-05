@@ -17,8 +17,8 @@ const testKey = "test-key-0123456789abcdef"
 
 // boot starts the whole binary on an ephemeral port and returns its base URL.
 // It is the only test in the suite with no mocks at all: it catches the wiring
-// mistakes � a middleware in the wrong order, a dependency never passed, a
-// route never registered � that unit tests are structurally unable to see.
+// mistakes — a middleware in the wrong order, a dependency never passed, a
+// route never registered — that unit tests are structurally unable to see.
 func boot(t *testing.T, env map[string]string) (string, func() int) {
 	t.Helper()
 
