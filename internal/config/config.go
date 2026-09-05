@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -93,9 +94,11 @@ func Load(getenv func(string) string) (Config, error) {
 		DrainTimeout:  l.dur("RUNMESH_DRAIN_TIMEOUT", 30*time.Second),
 		HardExitAfter: l.dur("RUNMESH_HARD_EXIT_AFTER", 60*time.Second),
 
-		Owner:             l.str("RUNMESH_OWNER", ""),
-		Workers:           l.num("RUNMESH_WORKERS", 8),
-		ClaimBatch:        l.num("RUNMESH_CLAIM_BATCH", 8),
+		Owner:   l.str("RUNMESH_OWNER", defaultOwner()),
+		Workers: l.num("RUNMESH_WORKERS", 8),
+		// 0 means "track the pool size"; resolved below, once Workers is known.
+		// A fixed default here would make RUNMESH_WORKERS=4 refuse to start.
+		ClaimBatch:        l.num("RUNMESH_CLAIM_BATCH", 0),
 		PollInterval:      l.dur("RUNMESH_POLL_INTERVAL", 250*time.Millisecond),
 		LeaseTTL:          l.dur("RUNMESH_LEASE_TTL", 30*time.Second),
 		HeartbeatInterval: l.dur("RUNMESH_HEARTBEAT_INTERVAL", 5*time.Second),
@@ -134,6 +137,9 @@ func Load(getenv func(string) string) (Config, error) {
 		LogFormat: l.str("RUNMESH_LOG_FORMAT", "json"),
 	}
 	c.APIKeys = l.apiKeys("RUNMESH_API_KEYS")
+	if c.ClaimBatch == 0 {
+		c.ClaimBatch = c.Workers
+	}
 
 	if err := errors.Join(append(l.errs, c.Validate()...)...); err != nil {
 		return Config{}, fmt.Errorf("config: %w", err)
@@ -247,6 +253,18 @@ func (c Config) APIKeyID(digest [32]byte) (string, bool) {
 
 // KeyDigest is the lookup key for APIKeys.
 func KeyDigest(presented string) [32]byte { return sha256.Sum256([]byte(presented)) }
+
+// defaultOwner names this process in the leases it takes. Host plus pid, so
+// two replicas on one machine cannot be confused for each other in the
+// reclaimed-an-expired-lease log line — which is the first thing anyone reads
+// when a worker dies.
+func defaultOwner() string {
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		host = "unknown"
+	}
+	return fmt.Sprintf("%s-%d", host, os.Getpid())
+}
 
 // loader accumulates parse errors instead of returning on the first one.
 type loader struct {
