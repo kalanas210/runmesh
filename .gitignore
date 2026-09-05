@@ -31,3 +31,5 @@ Thumbs.db
 node_modules/
 .next/
 out/
+coverage
+coverage.out
