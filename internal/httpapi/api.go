@@ -127,6 +127,7 @@ func New(d Deps) (http.Handler, *API, error) {
 		Recover(a.log),
 		BodyLimit(d.MaxRequestBytes),
 		Auth(d.APIKeys, a.log, unauthenticatedPath),
+		CaptureRoute(), // innermost: it must see the request the mux dispatched
 	)
 	return handler, a, nil
 }

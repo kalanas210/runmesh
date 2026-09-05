@@ -14,22 +14,45 @@ import (
 
 type ctxKey int
 
-const (
-	ctxRequestID ctxKey = iota
-	ctxAPIKeyID
-)
+const ctxRequestInfo ctxKey = iota
+
+// reqInfo is per-request scratch space that inner layers fill in and the
+// outermost logger reads back.
+//
+// A pointer rather than separate context values, and this is not incidental.
+// Middleware that adds a context value has to pass a NEW *http.Request
+// downstream, and the outer layers keep the old one — so anything an inner
+// layer learned would be invisible to the log line, which is the one place it
+// is actually needed. One pointer installed at the top, mutated in place on
+// the way down, read on the way out.
+//
+// It is written and read on a single goroutine, sequenced by the call stack.
+type reqInfo struct {
+	id    string
+	keyID string
+	route string
+}
+
+func infoFrom(ctx context.Context) *reqInfo {
+	info, _ := ctx.Value(ctxRequestInfo).(*reqInfo)
+	return info
+}
 
 // RequestIDFrom returns the request id attached by the RequestID middleware.
 func RequestIDFrom(ctx context.Context) string {
-	id, _ := ctx.Value(ctxRequestID).(string)
-	return id
+	if info := infoFrom(ctx); info != nil {
+		return info.id
+	}
+	return ""
 }
 
 // APIKeyIDFrom returns the id of the API key that authenticated the request.
 // It is the key's NAME, never the key itself.
 func APIKeyIDFrom(ctx context.Context) string {
-	id, _ := ctx.Value(ctxAPIKeyID).(string)
-	return id
+	if info := infoFrom(ctx); info != nil {
+		return info.keyID
+	}
+	return ""
 }
 
 // middleware is the standard net/http shape. There is no framework here and no
@@ -84,7 +107,8 @@ func RequestID(clk clock.Clock) middleware {
 				id = runmesh.NewID("req_", clk.Now())
 			}
 			w.Header().Set("X-Request-ID", id)
-			ctx := context.WithValue(r.Context(), ctxRequestID, id)
+			info := &reqInfo{id: id, route: "unmatched"}
+			ctx := context.WithValue(r.Context(), ctxRequestInfo, info)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
@@ -124,10 +148,10 @@ func Logger(log *slog.Logger, clk clock.Clock) middleware {
 				log.LogAttrs(r.Context(), level, "http request",
 					slog.String("request_id", RequestIDFrom(r.Context())),
 					slog.String("method", r.Method),
-					// r.Pattern is the matched ROUTE, not the raw path, so this
-					// label stays low-cardinality and is safe to use as a
-					// metric dimension in Week 3.
-					slog.String("route", routeOf(r)),
+					// The matched ROUTE, not the raw path, so this label stays
+					// low-cardinality and is safe to use as a metric dimension
+					// in Week 3. CaptureRoute records it from inside the chain.
+					slog.String("route", routeOf(r.Context())),
 					slog.String("path", r.URL.Path),
 					slog.Int("status", rec.status),
 					slog.Int64("bytes", rec.written),
@@ -214,8 +238,37 @@ func Auth(keys map[[32]byte]string, log *slog.Logger, exempt func(*http.Request)
 				writeError(w, r, log, errUnauthenticated)
 				return
 			}
-			ctx := context.WithValue(r.Context(), ctxAPIKeyID, id)
-			next.ServeHTTP(w, r.WithContext(ctx))
+			// Recorded in place rather than in a new context, so the outermost
+			// log line — which holds the original request — can still see it.
+			if info := infoFrom(r.Context()); info != nil {
+				info.keyID = id
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// CaptureRoute records the matched route pattern for the log line.
+//
+// It has to be the INNERMOST middleware, wrapping the mux directly, because
+// ServeMux sets Pattern on the request as it dispatches — and every layer
+// above has its own older copy. Reading it here, on the request the mux
+// actually received, is what turns "unmatched" into "GET /api/v1/jobs/{id}".
+//
+// If a future ServeMux stops populating Pattern, the label degrades to
+// "unmatched" rather than breaking anything.
+func CaptureRoute() middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			info := infoFrom(r.Context())
+			if info != nil {
+				defer func() {
+					if r.Pattern != "" {
+						info.route = r.Pattern
+					}
+				}()
+			}
+			next.ServeHTTP(w, r)
 		})
 	}
 }
@@ -233,9 +286,9 @@ func bearerToken(r *http.Request) (string, bool) {
 	return token, token != ""
 }
 
-func routeOf(r *http.Request) string {
-	if r.Pattern != "" {
-		return r.Pattern
+func routeOf(ctx context.Context) string {
+	if info := infoFrom(ctx); info != nil && info.route != "" {
+		return info.route
 	}
 	return "unmatched"
 }

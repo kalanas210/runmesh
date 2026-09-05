@@ -1,6 +1,7 @@
 package httpapi_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -8,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -743,4 +745,76 @@ func TestNewRejectsMissingDependencies(t *testing.T) {
 	}); err != nil {
 		t.Errorf("httpapi.New rejected a minimal valid configuration: %v", err)
 	}
+}
+
+// TestLogLineCarriesRouteAndKeyID pins the fix for a bug the running server
+// made obvious: every authenticated request logged route=unmatched and an
+// empty api_key_id.
+//
+// The cause was structural. Auth added the key id with a new context, which
+// means a NEW *http.Request downstream; the outermost Logger kept the old one
+// and could see neither the key id nor the route pattern the mux later set.
+// Both are the whole point of the log line — the route is Week 3's metric
+// dimension and the key id is the audit trail — so a test holds them here.
+func TestLogLineCarriesRouteAndKeyID(t *testing.T) {
+	t.Parallel()
+
+	var buf syncBuffer
+	f := newFixture(t, func(d *httpapi.Deps) {
+		d.Log = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	})
+
+	if rec := f.do(http.MethodGet, "/api/v1/jobs/job_missing", "", nil); rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d", rec.Code)
+	}
+
+	line := buf.String()
+	if !strings.Contains(line, `route="GET /api/v1/jobs/{id}"`) {
+		t.Errorf("the log line does not carry the matched route:\n%s", line)
+	}
+	if !strings.Contains(line, "api_key_id=ci") {
+		t.Errorf("the log line does not carry the API key id:\n%s", line)
+	}
+	// The key itself must never appear anywhere in a log line.
+	if strings.Contains(line, apiKey) {
+		t.Errorf("the log line contains the API key itself:\n%s", line)
+	}
+}
+
+// TestUnmatchedRouteStaysLowCardinality: an unknown path must not put an
+// attacker-controlled string into what will become a metric label.
+func TestUnmatchedRouteStaysLowCardinality(t *testing.T) {
+	t.Parallel()
+
+	var buf syncBuffer
+	f := newFixture(t, func(d *httpapi.Deps) {
+		d.Log = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	})
+
+	f.do(http.MethodGet, "/api/v1/attacker-controlled-9f2b", "", nil)
+	line := buf.String()
+	if !strings.Contains(line, "route=unmatched") {
+		t.Errorf("an unmatched path did not produce route=unmatched:\n%s", line)
+	}
+	if strings.Contains(line, "route=/api/v1/attacker") {
+		t.Errorf("the raw path leaked into the route label:\n%s", line)
+	}
+}
+
+// syncBuffer is an io.Writer the test can read while the handler writes.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
