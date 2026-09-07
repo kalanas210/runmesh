@@ -28,9 +28,11 @@ const ctxRequestInfo ctxKey = iota
 //
 // It is written and read on a single goroutine, sequenced by the call stack.
 type reqInfo struct {
-	id    string
-	keyID string
-	route string
+	id     string
+	keyID  string
+	key    config.APIKey
+	hasKey bool
+	route  string
 }
 
 func infoFrom(ctx context.Context) *reqInfo {
@@ -53,6 +55,17 @@ func APIKeyIDFrom(ctx context.Context) string {
 		return info.keyID
 	}
 	return ""
+}
+
+// APIKeyFrom returns the key that authenticated the request, so a route can ask
+// what it is allowed to do. It reports false on an unauthenticated request —
+// which, for a scoped route, means Auth never ran, and refusing is the only
+// safe answer.
+func APIKeyFrom(ctx context.Context) (config.APIKey, bool) {
+	if info := infoFrom(ctx); info != nil && info.hasKey {
+		return info.key, true
+	}
+	return config.APIKey{}, false
 }
 
 // middleware is the standard net/http shape. There is no framework here and no
@@ -215,7 +228,7 @@ func BodyLimit(max int64) middleware {
 //
 // health and ready are exempt: a load balancer must be able to probe a service
 // without holding a credential.
-func Auth(keys map[[32]byte]string, log *slog.Logger, exempt func(*http.Request) bool) middleware {
+func Auth(keys map[[32]byte]config.APIKey, log *slog.Logger, exempt func(*http.Request) bool) middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if exempt != nil && exempt(r) {
@@ -228,7 +241,7 @@ func Auth(keys map[[32]byte]string, log *slog.Logger, exempt func(*http.Request)
 				return
 			}
 			digest := config.KeyDigest(presented)
-			id, found := keys[digest]
+			key, found := keys[digest]
 			if !found {
 				writeError(w, r, log, errUnauthenticated)
 				return
@@ -239,9 +252,12 @@ func Auth(keys map[[32]byte]string, log *slog.Logger, exempt func(*http.Request)
 				return
 			}
 			// Recorded in place rather than in a new context, so the outermost
-			// log line — which holds the original request — can still see it.
+			// log line — which holds the original request — can still see it,
+			// and so the scope check inside the mux can read it back without a
+			// second lookup.
 			if info := infoFrom(r.Context()); info != nil {
-				info.keyID = id
+				info.keyID = key.ID
+				info.key, info.hasKey = key, true
 			}
 			next.ServeHTTP(w, r)
 		})

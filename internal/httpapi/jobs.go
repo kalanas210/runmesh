@@ -140,7 +140,7 @@ func (a *API) getJob(w http.ResponseWriter, r *http.Request) {
 // It answers 202, not 200: cancellation is a REQUEST. Steps a worker already
 // owns keep running until their next heartbeat delivers the news, so the body
 // may honestly say "state": "RUNNING" with cancel_requested_at set. That is
-// the only answer that stays true in Week 2, when the cancel lands on a
+// the only answer that stays true now that the cancel can land on a
 // different replica from the one executing the step.
 func (a *API) cancelJob(w http.ResponseWriter, r *http.Request) {
 	job, err := a.store.RequestCancel(r.Context(), r.PathValue("id"),

@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/kalanas210/runmesh/internal/clock"
+	"github.com/kalanas210/runmesh/internal/config"
 	"github.com/kalanas210/runmesh/internal/runmesh"
 	"github.com/kalanas210/runmesh/internal/tools"
 )
@@ -34,7 +35,7 @@ type Deps struct {
 	Runtime  Runtime
 	Clock    clock.Clock
 	Log      *slog.Logger
-	APIKeys  map[[32]byte]string
+	APIKeys  map[[32]byte]config.APIKey
 	Limits   runmesh.Limits
 	Defaults runmesh.Defaults
 
@@ -104,14 +105,13 @@ func New(d Deps) (http.Handler, *API, error) {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /api/v1/jobs", a.createJob)
-	mux.HandleFunc("GET /api/v1/jobs", a.listJobs)
-	mux.HandleFunc("GET /api/v1/jobs/{id}", a.getJob)
-	mux.HandleFunc("POST /api/v1/jobs/{id}/cancel", a.cancelJob)
-	mux.HandleFunc("GET /api/v1/jobs/{id}/events", a.jobEvents)
-	mux.HandleFunc("GET /api/v1/tools", a.listTools)
-	mux.HandleFunc("GET /api/v1/health", a.health)
-	mux.HandleFunc("GET /api/v1/ready", a.ready)
+	public := make(map[string]bool)
+	for _, rt := range a.routes() {
+		mux.Handle(rt.pattern, a.scoped(rt.scope, rt.handler))
+		if rt.scope == scopePublic {
+			public[pathOf(rt.pattern)] = true
+		}
+	}
 
 	// POST /api/v1/jobs/{id}/retry is in the plan's API sketch and is
 	// deliberately absent from Week 1: "reset the DAG from step X while
@@ -126,17 +126,77 @@ func New(d Deps) (http.Handler, *API, error) {
 		Logger(a.log, a.clock),
 		Recover(a.log),
 		BodyLimit(d.MaxRequestBytes),
-		Auth(d.APIKeys, a.log, unauthenticatedPath),
+		Auth(d.APIKeys, a.log, func(r *http.Request) bool { return public[r.URL.Path] }),
 		CaptureRoute(), // innermost: it must see the request the mux dispatched
 	)
 	return handler, a, nil
 }
 
-// unauthenticatedPath exempts the probes. A load balancer must be able to ask
-// whether this process is alive without holding a credential.
-func unauthenticatedPath(r *http.Request) bool {
-	return strings.HasPrefix(r.URL.Path, "/api/v1/health") ||
-		strings.HasPrefix(r.URL.Path, "/api/v1/ready")
+// route is one endpoint and the scope it demands.
+//
+// The table is data rather than eight HandleFunc calls so that "what may this
+// key do" is answerable by reading one screen, and so a test can walk it: see
+// TestEveryRouteStatesItsScope. Authorisation that lives inside handlers is
+// authorisation nobody can audit.
+type route struct {
+	pattern string
+	scope   config.Scope
+	handler http.HandlerFunc
+}
+
+// scopePublic marks a route that needs no credential at all. It is spelled out
+// rather than left as a zero value so that a route with no scope reads as a
+// decision instead of an omission.
+const scopePublic config.Scope = ""
+
+func (a *API) routes() []route {
+	return []route{
+		{"POST /api/v1/jobs", config.ScopeJobsWrite, a.createJob},
+		{"GET /api/v1/jobs", config.ScopeJobsRead, a.listJobs},
+		{"GET /api/v1/jobs/{id}", config.ScopeJobsRead, a.getJob},
+		// Cancelling is its own scope: submitting work and stopping somebody
+		// else's work are different authorities, and an agent that only ever
+		// submits should not be able to halt the fleet.
+		{"POST /api/v1/jobs/{id}/cancel", config.ScopeJobsCancel, a.cancelJob},
+		{"GET /api/v1/jobs/{id}/events", config.ScopeJobsRead, a.jobEvents},
+		{"GET /api/v1/tools", config.ScopeJobsRead, a.listTools},
+
+		// The probes carry no credential: a load balancer must be able to ask
+		// whether this process is alive and ready without holding one.
+		{"GET /api/v1/health", scopePublic, a.health},
+		{"GET /api/v1/ready", scopePublic, a.ready},
+	}
+}
+
+// scoped rejects a request whose key lacks the scope this route requires.
+//
+// It runs INSIDE the mux, after Auth has resolved the key, so a 403 names the
+// scope that was missing — a caller that has already authenticated learns what
+// it would need, which is help rather than disclosure. Authentication failures
+// stay deliberately uninformative; see errUnauthenticated.
+func (a *API) scoped(s config.Scope, h http.HandlerFunc) http.Handler {
+	if s == scopePublic {
+		return h
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key, ok := APIKeyFrom(r.Context())
+		if !ok || !key.Allows(s) {
+			writeError(w, r, a.log, &permissionError{scope: s})
+			return
+		}
+		h(w, r)
+	})
+}
+
+// pathOf strips the method from a ServeMux pattern. Only the fixed-path public
+// routes use it, so it needs no wildcard handling — and matching those paths
+// EXACTLY, rather than by prefix, is what stops a future "/api/v1/readyz" from
+// inheriting an exemption nobody granted it.
+func pathOf(pattern string) string {
+	if _, path, found := strings.Cut(pattern, " "); found {
+		return path
+	}
+	return pattern
 }
 
 // Draining makes readiness start failing. Calling it before the HTTP server

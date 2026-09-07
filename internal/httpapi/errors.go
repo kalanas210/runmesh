@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 
+	"github.com/kalanas210/runmesh/internal/config"
 	"github.com/kalanas210/runmesh/internal/runmesh"
 )
 
@@ -15,6 +16,7 @@ import (
 const (
 	CodeInvalidArgument    = "invalid_argument"
 	CodeUnauthenticated    = "unauthenticated"
+	CodePermissionDenied   = "permission_denied"
 	CodeNotFound           = "not_found"
 	CodeFailedPrecondition = "failed_precondition"
 	CodeResourceExhausted  = "resource_exhausted"
@@ -89,6 +91,18 @@ func classifyError(err error) (int, APIError) {
 			Message: "a valid API key is required",
 		}
 
+	case errors.As(err, new(*permissionError)):
+		// 403, not 401, and the difference matters to a client: the credential
+		// was accepted, so retrying with the same key will never work. Naming
+		// the missing scope tells an already-authenticated caller what to ask
+		// their operator for.
+		var pe *permissionError
+		errors.As(err, &pe)
+		return http.StatusForbidden, APIError{
+			Code:    CodePermissionDenied,
+			Message: "this API key does not carry the " + string(pe.scope) + " scope",
+		}
+
 	case errors.Is(err, runmesh.ErrNotFound):
 		return http.StatusNotFound, APIError{Code: CodeNotFound, Message: "not found"}
 
@@ -132,6 +146,14 @@ type badRequestError struct{ msg string }
 func (e *badRequestError) Error() string { return e.msg }
 
 func badRequest(msg string) error { return &badRequestError{msg: msg} }
+
+// permissionError is an authenticated caller asking for something its key does
+// not cover.
+type permissionError struct{ scope config.Scope }
+
+func (e *permissionError) Error() string {
+	return "httpapi: the API key lacks the " + string(e.scope) + " scope"
+}
 
 var (
 	errUnauthenticated = errors.New("httpapi: unauthenticated")

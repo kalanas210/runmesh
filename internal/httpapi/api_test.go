@@ -54,7 +54,9 @@ func newFixture(t *testing.T, opts ...func(*httpapi.Deps)) *fixture {
 		Runtime: stubRuntime{inflight: 2, workers: 8},
 		Clock:   f.clk,
 		Log:     slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError})),
-		APIKeys: map[[32]byte]string{config.KeyDigest(apiKey): "ci"},
+		APIKeys: map[[32]byte]config.APIKey{
+			config.KeyDigest(apiKey): {ID: "ci", Unscoped: true},
+		},
 		Limits: runmesh.Limits{
 			MaxSteps: 10, MaxDependsOn: 4, MaxParamsBytes: 1024,
 			MaxStepTimeout: time.Minute, MaxAttempts: 5, MaxResultBytes: 4096,
@@ -740,8 +742,10 @@ func TestNewRejectsMissingDependencies(t *testing.T) {
 		t.Error("httpapi.New accepted an empty key set; that would start an unauthenticated server")
 	}
 	if _, _, err := httpapi.New(httpapi.Deps{
-		Store:   store,
-		APIKeys: map[[32]byte]string{config.KeyDigest(apiKey): "ci"},
+		Store: store,
+		APIKeys: map[[32]byte]config.APIKey{
+			config.KeyDigest(apiKey): {ID: "ci", Unscoped: true},
+		},
 	}); err != nil {
 		t.Errorf("httpapi.New rejected a minimal valid configuration: %v", err)
 	}

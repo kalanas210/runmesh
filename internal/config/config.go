@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -29,10 +30,11 @@ type Config struct {
 	IdleTimeout       time.Duration
 	MaxRequestBytes   int64
 
-	// APIKeys maps the sha256 digest of a presented key to that key's id.
-	// Storing the digest rather than the key means the map lookup itself leaks
-	// no timing information about how many leading bytes of a guess matched.
-	APIKeys map[[32]byte]string
+	// APIKeys maps the sha256 digest of a presented key to what that key is
+	// and what it may do. Storing the digest rather than the key means the map
+	// lookup itself leaks no timing information about how many leading bytes of
+	// a guess matched.
+	APIKeys map[[32]byte]APIKey
 
 	// Shutdown, in the order the phases run.
 	ShutdownGrace time.Duration // stop accepting; let in-flight requests finish
@@ -62,9 +64,21 @@ type Config struct {
 	Limits        runmesh.Limits
 	Defaults      runmesh.Defaults
 
-	// Store
-	JobEventBuffer    int // per-job event ring
-	GlobalEventBuffer int // store-wide event ring
+	// Store.
+	//
+	// DatabaseURL selects the store. Empty means the in-memory store, which is
+	// a development convenience and NOT a deployment option: a restart loses
+	// every job, GET /ready says so, and the server warns at boot.
+	DatabaseURL       string
+	DBMaxOpenConns    int
+	DBMaxIdleConns    int
+	DBConnMaxLifetime time.Duration
+	DBConnMaxIdleTime time.Duration
+	DBConnectTimeout  time.Duration
+	MigrateOnBoot     bool
+
+	JobEventBuffer    int // per-job event ring, in-memory store only
+	GlobalEventBuffer int // store-wide event ring, in-memory store only
 
 	// Tools
 	EnableTestTools bool
@@ -127,6 +141,16 @@ func Load(getenv func(string) string) (Config, error) {
 			MaxAttempts: l.num("RUNMESH_MAX_ATTEMPTS", 3),
 		},
 
+		DatabaseURL: l.str("RUNMESH_DATABASE_URL", ""),
+		// 0 means "size it from the worker pool"; resolved below, once Workers
+		// is known, for the same reason ClaimBatch is.
+		DBMaxOpenConns:    l.num("RUNMESH_DB_MAX_OPEN_CONNS", 0),
+		DBMaxIdleConns:    l.num("RUNMESH_DB_MAX_IDLE_CONNS", 0),
+		DBConnMaxLifetime: l.dur("RUNMESH_DB_CONN_MAX_LIFETIME", 30*time.Minute),
+		DBConnMaxIdleTime: l.dur("RUNMESH_DB_CONN_MAX_IDLE_TIME", 5*time.Minute),
+		DBConnectTimeout:  l.dur("RUNMESH_DB_CONNECT_TIMEOUT", 10*time.Second),
+		MigrateOnBoot:     l.boolean("RUNMESH_MIGRATE_ON_BOOT", true),
+
 		JobEventBuffer:    l.num("RUNMESH_JOB_EVENT_BUFFER", 512),
 		GlobalEventBuffer: l.num("RUNMESH_GLOBAL_EVENT_BUFFER", 8192),
 
@@ -139,6 +163,16 @@ func Load(getenv func(string) string) (Config, error) {
 	c.APIKeys = l.apiKeys("RUNMESH_API_KEYS")
 	if c.ClaimBatch == 0 {
 		c.ClaimBatch = c.Workers
+	}
+	// The pool has to hold every worker settling an outcome at once, plus the
+	// dispatcher claiming, the reconciler sweeping, and a readiness probe. Size
+	// it below that and a drain can deadlock: every connection held by a worker
+	// waiting to write, and no connection left for the dispatcher to notice.
+	if c.DBMaxOpenConns == 0 {
+		c.DBMaxOpenConns = c.Workers + dbConnHeadroom
+	}
+	if c.DBMaxIdleConns == 0 {
+		c.DBMaxIdleConns = c.DBMaxOpenConns
 	}
 
 	if err := errors.Join(append(l.errs, c.Validate()...)...); err != nil {
@@ -155,7 +189,8 @@ func (c Config) Validate() []error {
 	bad := func(format string, a ...any) { errs = append(errs, fmt.Errorf(format, a...)) }
 
 	if len(c.APIKeys) == 0 {
-		bad("RUNMESH_API_KEYS is required (format: id=key,id=key) - refusing to start unauthenticated")
+		bad("RUNMESH_API_KEYS is required (format: id[:scope+scope]=key,...) - " +
+			"refusing to start unauthenticated")
 	}
 	if c.Workers < 1 {
 		bad("RUNMESH_WORKERS must be >= 1, got %d", c.Workers)
@@ -225,6 +260,24 @@ func (c Config) Validate() []error {
 	if c.Limits.MaxSteps < 1 {
 		bad("RUNMESH_MAX_STEPS must be >= 1, got %d", c.Limits.MaxSteps)
 	}
+	if c.DatabaseURL != "" {
+		if c.DBMaxOpenConns < c.Workers+dbConnHeadroom {
+			bad("RUNMESH_DB_MAX_OPEN_CONNS must be at least RUNMESH_WORKERS + %d = %d, got %d "+
+				"(every worker may hold a connection to settle its outcome while the "+
+				"dispatcher, the reconciler and a readiness probe still need one)",
+				dbConnHeadroom, c.Workers+dbConnHeadroom, c.DBMaxOpenConns)
+		}
+		if c.DBMaxIdleConns < 1 || c.DBMaxIdleConns > c.DBMaxOpenConns {
+			bad("RUNMESH_DB_MAX_IDLE_CONNS must be in [1, RUNMESH_DB_MAX_OPEN_CONNS=%d], got %d",
+				c.DBMaxOpenConns, c.DBMaxIdleConns)
+		}
+		// A connection that outlives the drain it is part of would keep a
+		// half-finished transaction alive past the point the process claims to
+		// have stopped.
+		if c.DBConnectTimeout <= 0 {
+			bad("RUNMESH_DB_CONNECT_TIMEOUT must be > 0, got %s", c.DBConnectTimeout)
+		}
+	}
 	if c.JobEventBuffer < 1 {
 		bad("RUNMESH_JOB_EVENT_BUFFER must be >= 1, got %d", c.JobEventBuffer)
 	}
@@ -245,10 +298,42 @@ func (c Config) Validate() []error {
 	return errs
 }
 
+// dbConnHeadroom is how many connections the pool must hold beyond the worker
+// pool: one for the dispatcher, one for the reconciler, and two for concurrent
+// API traffic including the readiness probe.
+const dbConnHeadroom = 4
+
+// Durable reports whether the configured store survives a restart. It is the
+// value GET /api/v1/ready publishes, and the reason the server warns at boot
+// when it is false.
+func (c Config) Durable() bool { return c.DatabaseURL != "" }
+
+// StoreName names the configured store for logs and the readiness body.
+func (c Config) StoreName() string {
+	if c.Durable() {
+		return "postgres"
+	}
+	return "memory"
+}
+
 // APIKeyID returns the id of the key with this digest, if it is configured.
 func (c Config) APIKeyID(digest [32]byte) (string, bool) {
-	id, ok := c.APIKeys[digest]
-	return id, ok
+	key, ok := c.APIKeys[digest]
+	return key.ID, ok
+}
+
+// UnscopedKeyIDs names the keys configured without a scope list, which are
+// therefore granted everything. The server logs them at boot: a permissive
+// default is defensible only if it is impossible to hold by accident.
+func (c Config) UnscopedKeyIDs() []string {
+	var out []string
+	for _, k := range c.APIKeys {
+		if k.Unscoped {
+			out = append(out, k.ID)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // KeyDigest is the lookup key for APIKeys.
@@ -349,35 +434,35 @@ func (l *loader) level(key string, def slog.Level) slog.Level {
 	return lvl
 }
 
-// apiKeys parses "id=key,id=key". A bare key is accepted and given a generated
-// id, because the id exists for log correlation rather than for authentication
-// — but naming keys is what lets an operator revoke one without guessing which.
-func (l *loader) apiKeys(key string) map[[32]byte]string {
+// apiKeys parses the key list: comma-separated `id[:scope+scope]=key` entries.
+//
+// `dev=abc…` from Week 1 still parses, as an unscoped key — see APIKey.Unscoped
+// for why an upgrade must not silently strip every running key of its access.
+func (l *loader) apiKeys(key string) map[[32]byte]APIKey {
 	v, ok := l.raw(key)
 	if !ok {
 		return nil
 	}
-	out := make(map[[32]byte]string)
+	out := make(map[[32]byte]APIKey)
 	for i, part := range strings.Split(v, ",") {
 		part = strings.TrimSpace(part)
 		if part == "" {
 			continue
 		}
-		id, secret, named := strings.Cut(part, "=")
-		if !named {
-			secret = id
-			id = "key" + strconv.Itoa(i+1)
+		parsed, secret, err := parseAPIKeyEntry(part, i+1)
+		if err != nil {
+			l.errs = append(l.errs, fmt.Errorf("%s: %w", key, err))
+			continue
 		}
-		id, secret = strings.TrimSpace(id), strings.TrimSpace(secret)
 		switch {
 		case secret == "":
 			l.errs = append(l.errs, fmt.Errorf("%s: entry %d has an empty key", key, i+1))
 		case len(secret) < 16:
 			l.errs = append(l.errs, fmt.Errorf(
 				"%s: key %q is %d characters; use at least 16 (openssl rand -hex 32)",
-				key, id, len(secret)))
+				key, parsed.ID, len(secret)))
 		default:
-			out[KeyDigest(secret)] = id
+			out[KeyDigest(secret)] = parsed
 		}
 	}
 	return out
