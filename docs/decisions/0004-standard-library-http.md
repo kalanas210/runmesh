@@ -1,6 +1,7 @@
 # ADR 0004 — Standard-library `net/http`, zero third-party dependencies in Week 1
 
-**Status:** Accepted · Week 1
+**Status:** Accepted · Week 1 · the dependency count is amended by
+[ADR 0007](0007-one-dependency-the-postgres-driver.md)
 
 ## Context
 
@@ -31,7 +32,9 @@ logging is `log/slog`. Week 1 has **no third-party module requirements at all** 
   request-scoped values. All of it is short, and all of it is the part worth
   understanding.
 - Every dependency added later has to justify itself against a repository that
-  currently has none.
+  currently has none. Week 2 cashed that in exactly once, for the PostgreSQL
+  driver; the routing, middleware, logging and identifier decisions above are
+  unchanged, and `net/http` is still the whole of the HTTP surface.
 
 ## Alternatives considered
 

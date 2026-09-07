@@ -23,18 +23,21 @@ User goal ──▶ planner ──▶ validated plan ──▶ RunMesh ──▶
 
 ---
 
-## Status: Week 1 of 6
+## Status: Week 2 of 6
 
 | | |
 |---|---|
 | **Working now** | HTTP API, step DAG, worker pool, per-step timeouts, cancellation, retries with backoff, leases + reconciler, execution timeline, graceful shutdown |
-| **In memory** | **A restart loses every job.** PostgreSQL arrives in Week 2 |
-| **Dependencies** | **Zero.** `go.mod` has no `require` block |
-| **Tests** | 116 tests, 230 cases, all green under `-race`; 82–91% coverage per package |
+| **Durable** | PostgreSQL state and a `SKIP LOCKED` queue. A killed process loses nothing: its leases expire and another replica finishes the work |
+| **Auth** | Scoped API keys — `jobs.read`, `jobs.write`, `jobs.cancel`, `admin` |
+| **Dependencies** | **One direct:** the PostgreSQL driver, imported in exactly one file, reached only through `database/sql` ([ADR 0007](docs/decisions/0007-one-dependency-the-postgres-driver.md)) |
+| **Tests** | 139 tests, 329 cases, all green under `-race`; 84% of statements. Includes the store conformance suite and a crash-recovery test against real PostgreSQL |
 
-`GET /api/v1/ready` reports `"durable": false`, and the server logs a warning
-at boot. A status endpoint that overstated durability would be worse than no
-status endpoint.
+Without `RUNMESH_DATABASE_URL` the server still runs on the in-memory store for
+development — and says so, loudly, at boot and in `GET /api/v1/ready`
+(`"durable": false`). A URL that is set but unreachable **fails the boot**: it
+never falls back, because silently starting non-durable is how an outage turns
+into data loss.
 
 <details>
 <summary>Roadmap</summary>
@@ -42,7 +45,7 @@ status endpoint.
 | Week | Delivers |
 |---|---|
 | 1 ✅ | Go API, job/step DAG, worker pool, retries, leases, cancellation, timeouts |
-| 2 | PostgreSQL state + `SKIP LOCKED` queue, real crash recovery, scoped API keys |
+| 2 ✅ | PostgreSQL state + `SKIP LOCKED` queue, real crash recovery, scoped API keys |
 | 3 | Docker, `kind` + Calico, Kubernetes Job execution via `client-go`, RBAC |
 | 4 | Tool sandbox: resource limits, non-root, NetworkPolicy, execution policy |
 | 5 | Gemini planner, structured output → schema validation → policy validation |
@@ -54,17 +57,42 @@ status endpoint.
 
 ## Quick start
 
-Requires Go 1.25+. Nothing else.
+Requires Go 1.25+ and Docker for the database.
 
 ```bash
+docker compose up -d --wait postgres
+
 export RUNMESH_API_KEYS="dev=$(openssl rand -hex 32)"
+export RUNMESH_DATABASE_URL="postgres://runmesh:runmesh@127.0.0.1:5432/runmesh?sslmode=disable"
 go run ./cmd/server
 ```
+
+Migrations are embedded in the binary and applied at boot, under an advisory
+lock so a rolling deploy of five replicas runs them exactly once.
+
+If a PostgreSQL is already installed on the host it owns 5432 (and often 5433
+too), so the container cannot bind. Publish it somewhere else — the port inside
+the container never moves:
+
+```bash
+RUNMESH_DB_PORT=5434 docker compose up -d --wait postgres
+make test-pg RUNMESH_DB_PORT=5434        # ./task.ps1 test-pg on Windows
+```
+
+Worth knowing, because the symptom is misleading: compose reports the container
+*healthy* while connections quietly reach the other PostgreSQL, and the error is
+`password authentication failed`. The health check runs inside the container and
+cannot see who owns the host port.
+
+Without Docker, drop `RUNMESH_DATABASE_URL` and everything below still works —
+against the in-memory store, which loses every job on restart and tells you so.
 
 On Windows PowerShell:
 
 ```powershell
-$env:RUNMESH_API_KEYS = "dev=0123456789abcdef0123456789abcdef"; go run ./cmd/server
+$env:RUNMESH_API_KEYS = "dev=0123456789abcdef0123456789abcdef"
+$env:RUNMESH_DATABASE_URL = "postgres://runmesh:runmesh@127.0.0.1:5432/runmesh?sslmode=disable"
+go run ./cmd/server
 ```
 
 Then submit a diamond-shaped plan — one step, two parallel branches, one join:
@@ -85,19 +113,27 @@ curl -sS -X POST localhost:8080/api/v1/jobs \
 {
   "id": "job_06g71af4wx3vdak8enst952h34",
   "state": "SUCCEEDED",
-  "duration_ms": 120,          // not 210: the two branches ran at the same time
+  "duration_ms": 198,          // not 210+: the two branches ran at the same time
   "steps": [
-    {"id": "fetch",     "state": "SUCCEEDED", "attempt": 1, "duration_ms": 0},
-    {"id": "analyze_a", "state": "SUCCEEDED", "attempt": 1, "duration_ms": 120},
-    {"id": "analyze_b", "state": "SUCCEEDED", "attempt": 1, "duration_ms": 90},
-    {"id": "report",    "state": "SUCCEEDED", "attempt": 1, "duration_ms": 0}
+    {"id": "fetch",     "state": "SUCCEEDED", "attempt": 1, "duration_ms": 8},
+    {"id": "analyze_a", "state": "SUCCEEDED", "attempt": 1, "duration_ms": 130},
+    {"id": "analyze_b", "state": "SUCCEEDED", "attempt": 1, "duration_ms": 108},
+    {"id": "report",    "state": "SUCCEEDED", "attempt": 1, "duration_ms": 5}
   ]
 }
 ```
 
-The 120 ms total against 210 ms of work is the whole point: `analyze_a` and
-`analyze_b` became claimable the instant `fetch` succeeded, and `report` waited
-for both.
+`analyze_a` and `analyze_b` became claimable the instant `fetch` succeeded, and
+`report` waited for both — so the job costs one 120 ms branch rather than the
+sum of two.
+
+Those are real numbers from a local PostgreSQL, and they are **honest about what
+durability costs**: roughly 70–100 ms of the total is round trips, because each
+step is now a claim, a start, heartbeats and a finish, each its own transaction.
+The in-memory store finishes the same plan in about 120 ms. Somebody will ask
+which number the README should show; it should show this one, because this is
+the one where a restart does not lose the job. The first submission after a boot
+is slower again (~430 ms) while the pool warms and PostgreSQL caches the plans.
 
 ### The execution timeline
 
@@ -152,9 +188,9 @@ POST /api/v1/jobs/{id}/cancel  →  202 Accepted
 
 **202, and the body says `RUNNING`.** Cancellation is a request. A step a
 worker already owns keeps running until its next heartbeat delivers the news,
-and the heartbeat is the only mechanism that still works in Week 2, when the
-cancelling API call lands on a different replica from the step. Honest state
-beats fast state.
+and the heartbeat is the only mechanism that still works now that the cancelling
+API call can land on a different replica from the step — which, with a shared
+database, it can. Honest state beats fast state.
 
 Moments later:
 
@@ -187,21 +223,42 @@ in a loop than when it is a human who would notice.
 ## API
 
 ```
-POST   /api/v1/jobs                  submit a plan     201 · 200 replay · 400 · 401 · 413 · 429
-GET    /api/v1/jobs                  list, keyset-paged        200 · 400 · 401
-GET    /api/v1/jobs/{id}             one job with its steps    200 · 401 · 404
-POST   /api/v1/jobs/{id}/cancel      request cancellation      202 · 401 · 404 · 409
-GET    /api/v1/jobs/{id}/events      execution timeline        200 · 400 · 401 · 404
-GET    /api/v1/tools                 registry + contracts      200 · 401
-GET    /api/v1/health                liveness                  200        (no auth)
-GET    /api/v1/ready                 readiness                 200 · 503  (no auth)
+                                                       scope                statuses
+POST   /api/v1/jobs           submit a plan            jobs.write    201 · 200 replay · 400 · 401 · 403 · 413 · 429
+GET    /api/v1/jobs           list, keyset-paged       jobs.read     200 · 400 · 401 · 403
+GET    /api/v1/jobs/{id}      one job with its steps   jobs.read     200 · 401 · 403 · 404
+POST   /api/v1/jobs/{id}/cancel   request cancellation jobs.cancel   202 · 401 · 403 · 404 · 409
+GET    /api/v1/jobs/{id}/events   execution timeline   jobs.read     200 · 400 · 401 · 403 · 404
+GET    /api/v1/tools          registry + contracts     jobs.read     200 · 401 · 403
+GET    /api/v1/health         liveness                 —             200
+GET    /api/v1/ready          readiness                —             200 · 503
 ```
 
-Auth is `Authorization: Bearer <key>`. Keys are configured as
-`RUNMESH_API_KEYS=id=key,id=key` and stored as sha256 digests, so the lookup
-itself leaks no timing information about how many leading bytes of a guess
-matched. Every rejection is byte-identical: a caller probing for valid keys
+Auth is `Authorization: Bearer <key>`. Keys are stored as sha256 digests, so the
+lookup itself leaks no timing information about how many leading bytes of a
+guess matched. Every **401** is byte-identical: a caller probing for valid keys
 learns nothing about which half of its guess was wrong.
+
+A **403** is deliberately the opposite. The credential was accepted, so the
+answer names the scope that was missing — retrying with the same key will never
+work, and an authenticated caller may as well be told what to ask for.
+
+```bash
+RUNMESH_API_KEYS=dash:jobs.read=$K1,planner:jobs.read+jobs.write=$K2,ops:admin=$K3
+```
+
+`jobs.cancel` is separate from `jobs.write` on purpose: submitting work and
+stopping somebody else's are different authorities, and an agent in a retry loop
+should not be able to halt the fleet. A key with no scope list is granted
+everything — `dev=<key>` from Week 1 still works, because an upgrade that
+silently stripped every running key of its access would be a worse failure than
+a permissive default — and the server names every such key in a warning at boot.
+
+The route table in [`internal/httpapi/api.go`](internal/httpapi/api.go) is the
+whole of the authorisation policy, as data. A test walks it and fails on any
+route that requires no scope without being one of the two probes, and a second
+test walks every route against every scope, so a new endpoint reachable by a
+read-only key is a test failure rather than an audit finding.
 
 `Idempotency-Key` on a submission makes a client retry safe — a replay returns
 the original job with `200` and `Idempotency-Replayed: true`, never a second
@@ -233,21 +290,40 @@ job.
 **Readiness is a predicate, not a state.** A step whose dependencies are
 unsatisfied sits in `QUEUED`, and the claim query excludes it. There is no
 `BLOCKED` state, no materialised pending-dependency counter that can drift, and
-therefore no "who unblocks this step" question to get wrong. The predicate is
-written once, and it is deliberately the same expression as the Week-2 SQL:
+therefore no "who unblocks this step" question to get wrong. Here it is, as it
+actually runs:
 
 ```sql
-  job.cancel_requested_at IS NULL
-  AND job.state IN ('QUEUED','RUNNING')
-  AND step.state IN ('QUEUED','RETRYING')
-  AND step.next_attempt_at <= $now
-  AND (step.lease_expires_at IS NULL OR step.lease_expires_at <= $now)
-  AND NOT EXISTS (SELECT 1 FROM job_steps d
-                   WHERE d.job_id = s.job_id AND d.id = ANY(s.depends_on)
-                     AND d.state <> 'SUCCEEDED')
-ORDER BY job.priority DESC, job.created_at, step.id
-FOR UPDATE SKIP LOCKED
+SELECT s.job_id, s.id
+  FROM job_steps s
+  JOIN jobs j ON j.id = s.job_id
+ WHERE     j.cancel_requested_at IS NULL
+       AND j.state IN ('QUEUED','RUNNING')
+       AND s.state IN ('QUEUED','RETRYING')
+       AND s.next_attempt_at <= $1
+       AND (s.lease_expires_at IS NULL OR s.lease_expires_at <= $1)
+       AND NOT EXISTS (
+             SELECT 1 FROM unnest(s.depends_on) AS dep (id)
+              WHERE NOT EXISTS (
+                    SELECT 1 FROM job_steps d
+                     WHERE d.job_id = s.job_id AND d.id = dep.id
+                       AND d.state = 'SUCCEEDED'))
+ ORDER BY j.priority DESC, j.created_at, j.id, s.id
+ LIMIT $2
+ FOR UPDATE OF j SKIP LOCKED
 ```
+
+The dependency clause is doubly negated — *there is no dependency that is not a
+`SUCCEEDED` step* — rather than the shorter `AND d.state <> 'SUCCEEDED'`. The
+short form treats a dependency naming a step that does not exist as *satisfied*:
+no row, nothing found, nothing blocks. Plan validation makes that impossible
+today, which is exactly why it is the kind of assumption that stops being true
+later. `jobstate.Claimable` is the same expression in Go, and both stores run
+against the same conformance suite.
+
+`FOR UPDATE OF **j**` — the job, not the step — is the lock protocol, and it is
+the difference between a system that deadlocks under load and one that cannot.
+See [ADR 0008](docs/decisions/0008-the-job-row-is-the-lock.md).
 
 **Backoff is a column, not a timer.** A retrying step is simply not claimable
 until `next_attempt_at`. There is no sleeping goroutine per retrying step, so a
@@ -290,12 +366,56 @@ simply expired spends one, because a worker that reliably dies on one step must
 eventually exhaust `max_attempts` rather than crash-loop the fleet. The two are
 asserted side by side in one test named after the asymmetry.
 
+### What Week 2 actually changed
+
+Three things, and only one of them is "we added a database".
+
+**A second store is two places for the policy to be wrong.** The subtlest code
+in this project is not the SQL — it is the transition policy: the fail-fast
+trigger that has to fire from *every* writer, the cancel propagation that must
+not touch a leased step, the doomed-dependent sweep without which
+`continue_on_failure` hangs for ever. Reimplementing that in SQL and trusting a
+test suite to catch divergence catches only the cases somebody thought to write
+down. So it was extracted instead: [`internal/jobstate`](internal/jobstate) is
+pure, stdlib-only, and both stores call it. **They do not agree by testing; they
+agree by being the same code.** What [`internal/storetest`](internal/storetest)
+then proves is the part that genuinely differs — the predicate as real
+`SKIP LOCKED` SQL, fencing under real contention, paging over real rows.
+
+**One lock, taken first, everywhere.** `Claim` naturally wants a step row and
+then the job row; `Finish` naturally wants the job row and then a step row. That
+is a textbook ABBA deadlock, and it would surface only under production
+concurrency. Every mutating path now takes the `jobs` row first — the sweeps get
+there through `FOR UPDATE OF j SKIP LOCKED` — so the cycle cannot be built. The
+one exception is `Heartbeat`, the hottest write in the system, which extends a
+lease on a step nothing else contends for and so cannot be half of a cycle.
+[ADR 0008](docs/decisions/0008-the-job-row-is-the-lock.md) has the reasoning and
+what it costs.
+
+**Crash recovery stopped being a claim.** Week 1 had leases, a reconciler and a
+documented recovery path, none of which could ever run: the store died with the
+process, so the sweep always woke to an empty world.
+[`cmd/server/crash_test.go`](cmd/server/crash_test.go) now starts a real server
+as a subprocess, waits until a step is genuinely `RUNNING`, and **kills it** — no
+signal handler, no drain, the lease left in the database with nobody to renew
+it. A different process, against the same database, finishes the job. The test
+then asserts the crash spent exactly **one** unit of retry budget, because a
+worker that reliably dies on one step has to exhaust `max_attempts` rather than
+crash-loop the fleet — while a graceful drain, asserted beside it, spends none.
+
 ### Testing
 
 ```bash
-./task.ps1 check     # Windows: lint + race
-make check           # everything CI runs
+make test            # everything that needs no database
+make test-pg         # starts PostgreSQL, then the whole suite under -race
+./task.ps1 test-pg   # the same, on Windows
 ```
+
+The PostgreSQL cases **skip** when `RUNMESH_TEST_DATABASE_URL` is unset, so
+`go test ./...` still works on a laptop with no database. CI is precisely where
+that skip would be a lie, so CI always provides one — and a test fails the build
+if it ever stops doing so. A conformance suite that silently skips is worse than
+no conformance suite: it reports green for a store nobody ran.
 
 There is **no `time.Sleep` anywhere in the suite** — enforced by the same
 `go/parser` walk that guards production code. Time is injected, so a test that
@@ -324,19 +444,35 @@ reviewers over the codebase, then three skeptics per finding, each trying to
   every writer ends in, so it is a property of the transition rather than of
   one call site.
 
-Both regressions are in the shared store suite, so the Week-2 PostgreSQL store
-inherits them. Details are in the commit that fixed them.
+Both regressions live in the shared store suite, and both now hold the
+PostgreSQL store too — the fail-fast one twice over, since the policy that fixes
+it is the code `pgstore` calls rather than a rule it re-implements.
 
-The highest-value test here is [`internal/storetest`](internal/storetest):
-an **exported conformance suite** the in-memory store must pass today and the
-PostgreSQL store must pass *unmodified* in Week 2. Every design claims its
-interface is database-ready; this one makes the claim executable, so a
-divergence from real `SKIP LOCKED` semantics fails a test rather than surfacing
-in production a month later.
+The highest-value test here is [`internal/storetest`](internal/storetest): an
+**exported conformance suite** that `memstore` passed in Week 1 and `pgstore`
+passes now. Every design claims its store interface is database-ready; this one
+made the claim executable, and then ran it — 34 cases against a real server,
+including 32 concurrent claimers taking 500 steps and each step coming out
+exactly once.
+
+Every Week-1 case passed against PostgreSQL unmodified, and not one line of
+`engine.Store` or `httpapi.Store` changed to accommodate it. That is the actual
+test of whether a consumer-declared interface was designed or merely described.
+
+**One case was added, and it is the more interesting half of the story.** The
+suite did *not* catch that `pgstore.ListJobs` returned jobs without their steps,
+because every existing case checked ids and counts — while `GET /api/v1/jobs`
+renders each job's steps in full. Two stores, two different response bodies from
+one endpoint. It was found by reading the API layer against the new store, and
+the fix went into the *suite* rather than into `pgstore`'s own tests, so both
+implementations are now held to it, including the one that was already right.
+A conformance suite is a living contract, not an artefact of the week it was
+written.
 
 > **Windows note.** The race detector needs cgo and a **64-bit** C compiler.
 > A 32-bit MinGW on `PATH` fails with *"64-bit mode not compiled in"*.
-> `./task.ps1 race` finds a usable toolchain automatically; otherwise
+> `./task.ps1 race` finds a usable toolchain automatically — it looks in
+> `C:\msys64\mingw64in` and two other usual places; otherwise
 > `choco install mingw`, or run the suite in WSL2. CI runs on Linux, where this
 > does not arise.
 
@@ -364,18 +500,21 @@ cmd/server/          the only wiring in the codebase, and a whole-binary test
 internal/
   runmesh/           domain: states, plans, jobs, leases, events. stdlib only
   clock/             the only source of time, plus the purity test enforcing it
-  memstore/          in-memory store, written as a faithful SQL simulation
-  storetest/         the exported conformance suite pgstore must also pass
+  jobstate/          the transition policy BOTH stores call. pure, stdlib only
+  memstore/          in-memory store, for development and for fast tests
+  pgstore/           the durable store: SKIP LOCKED queue, migrations, fencing
+  storetest/         the conformance suite both stores pass, unmodified
   engine/            dispatcher, worker pool, reconciler, and the pure policy
   tools/             the plugin boundary and the Executor seam for Kubernetes
   httpapi/           net/http only; its own narrower view of the store
   config/            every knob, validated at boot
+migrations/          the schema, embedded in the binary
 docs/
   architecture/      diagrams and the map of where the engineering is
   decisions/         ADRs for the choices with real alternatives
 ```
 
-Eleven packages, one binary, zero third-party dependencies.
+Thirteen packages, one binary, one direct dependency (and the five it brings).
 
 ### Design records
 
@@ -385,6 +524,8 @@ Eleven packages, one binary, zero third-party dependencies.
 - [0004 — Standard-library `net/http`, zero third-party dependencies](docs/decisions/0004-standard-library-http.md)
 - [0005 — The store owns every state transition](docs/decisions/0005-store-owns-transitions.md)
 - [0006 — Readiness is a predicate, not a state](docs/decisions/0006-readiness-is-derived.md)
+- [0007 — One dependency: the PostgreSQL driver](docs/decisions/0007-one-dependency-the-postgres-driver.md)
+- [0008 — The job row is the lock](docs/decisions/0008-the-job-row-is-the-lock.md)
 
 ---
 

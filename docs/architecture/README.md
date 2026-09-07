@@ -43,11 +43,11 @@ sequenceDiagram
     C->>A: POST /api/v1/jobs
     A->>A: validate plan (schema + policy)
     A->>S: persist job + steps (QUEUED)
-    A-->>C: 202 Accepted {job_id}
+    A-->>C: 201 Created {job_id}
 
     loop until no ready steps
         W->>Q: claim ready step (lease)
-        Q->>S: QUEUED -> RUNNING (guarded)
+        Q->>S: QUEUED -> SCHEDULED (guarded, SKIP LOCKED)
         W->>T: execute(ctx with deadline)
         alt success
             T-->>W: result
@@ -98,9 +98,58 @@ stateDiagram-v2
 | Failure policy | Error taxonomy → retryable vs terminal; exponential backoff | Week 1 |
 | Durability | PostgreSQL store; queue via `SELECT … FOR UPDATE SKIP LOCKED` | Week 2 |
 | Crash recovery | Leases + heartbeats + a reconciler loop over expired leases | Week 2 |
+| Authorisation | Scoped API keys, enforced from a route table a test walks | Week 2 |
 | Isolation | Kubernetes Jobs: non-root, resource limits, NetworkPolicy | Week 3–4 |
 | Planning | Gemini structured output → schema validation → policy validation | Week 5 |
 | Observability | Event timeline, Prometheus metrics, execution waterfall UI | Week 6 |
+
+## Persistence
+
+Three tables, and the lock protocol that keeps them consistent.
+
+```mermaid
+erDiagram
+    jobs ||--o{ job_steps : "has"
+    jobs ||--o{ job_events : "has"
+
+    jobs {
+        text id PK "k-sortable, so the PK b-tree appends"
+        text state
+        int priority
+        timestamptz cancel_requested_at "a flag, not a state"
+        text idempotency_key UK "partial unique index"
+        bigint event_seq "bumped with the transition"
+    }
+    job_steps {
+        text job_id PK, FK
+        text id PK "author-supplied, unique in the job"
+        text_array depends_on "the readiness predicate reads this"
+        text state
+        int attempt "monotonic: names the execution"
+        int failures "the retry budget"
+        timestamptz next_attempt_at "the backoff IS this column"
+        text lease_id "the fencing token"
+        timestamptz lease_expires_at
+    }
+    job_events {
+        bigserial global_seq PK "store-wide cursor"
+        text job_id FK
+        bigint seq "per-job, 1-based, gap-free"
+        text type
+    }
+```
+
+**The `jobs` row is the lock.** Every mutating path takes it first and only then
+touches step rows, so the two natural lock orders — `Claim` wanting steps then
+job, `Finish` wanting job then step — cannot form a cycle. The sweeps take it
+through `FOR UPDATE OF j SKIP LOCKED`; `Heartbeat` is the one write that takes
+no job lock at all, because it is the hottest path in the system and cannot be
+half of a cycle. See [ADR 0008](../decisions/0008-the-job-row-is-the-lock.md).
+
+**Neither store implements the transition policy.** Both call
+`internal/jobstate`, so the in-memory and PostgreSQL stores cannot disagree
+about what a failure dooms or what a cancellation touches. `internal/storetest`
+then covers what genuinely differs between them.
 
 ## Design records
 
@@ -112,3 +161,5 @@ Decisions with real alternatives are recorded in [`docs/decisions`](../decisions
 - [0004 — Standard-library `net/http`, zero third-party dependencies](../decisions/0004-standard-library-http.md)
 - [0005 — The store owns every state transition](../decisions/0005-store-owns-transitions.md)
 - [0006 — Readiness is a predicate, not a state](../decisions/0006-readiness-is-derived.md)
+- [0007 — One dependency: the PostgreSQL driver](../decisions/0007-one-dependency-the-postgres-driver.md)
+- [0008 — The job row is the lock](../decisions/0008-the-job-row-is-the-lock.md)
