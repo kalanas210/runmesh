@@ -1,0 +1,65 @@
+# Local PostgreSQL for development and for the conformance suite.
+#
+# Only the database. RunMesh itself still runs with `go run ./cmd/server`,
+# because a rebuild-per-change loop through an image is a worse way to work on
+# a Go binary than `go run` is. The app service arrives in Week 3, with the
+# image the Kubernetes deployment needs.
+#
+#   docker compose up -d
+#   export RUNMESH_DATABASE_URL='postgres://runmesh:runmesh@127.0.0.1:5432/runmesh?sslmode=disable'
+#   go run ./cmd/server
+#
+# A native PostgreSQL on the host already owns 5432 on a lot of developer
+# machines, and the container would simply fail to bind. Set RUNMESH_DB_PORT to
+# publish somewhere else — the port INSIDE the container never changes, so
+# nothing but the connection string moves:
+#
+#   RUNMESH_DB_PORT=5434 docker compose up -d --wait postgres
+#
+# Pick a port nothing else has, and check rather than assume. On Windows two
+# processes can end up listening on the same port, and the symptom is
+#
+#   FATAL: password authentication failed for user "runmesh"
+#
+# from a container that compose reports as healthy — because the health check
+# runs INSIDE the container and knows nothing about who owns the host port. What
+# actually happened is that the connection reached somebody else's PostgreSQL.
+# `netstat -ano | grep :5433` names the owner.
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: runmesh-postgres
+    environment:
+      POSTGRES_USER: runmesh
+      POSTGRES_PASSWORD: runmesh
+      POSTGRES_DB: runmesh
+      # The container is scoped to one project on one laptop, so the encoding
+      # and collation are pinned rather than inherited from whatever the host
+      # happens to have: a collation difference changes index ordering, and
+      # "works on my machine" about ORDER BY is a miserable afternoon.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      - "${RUNMESH_DB_PORT:-5432}:5432"
+    volumes:
+      - runmesh-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # A TCP port opens before PostgreSQL is ready to answer queries, so the
+      # check asks the server a question instead of asking the kernel.
+      test: ["CMD-SHELL", "pg_isready -U runmesh -d runmesh"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+    command:
+      # Development settings, and dangerous ones in production: durability is
+      # traded for speed because this data is disposable by definition.
+      - "postgres"
+      - "-c"
+      - "fsync=off"
+      - "-c"
+      - "synchronous_commit=off"
+      - "-c"
+      - "max_connections=200"
+
+volumes:
+  runmesh-pgdata:

@@ -12,6 +12,31 @@ jobs:
   build:
     name: build / vet / test
     runs-on: ubuntu-latest
+
+    # The PostgreSQL conformance suite skips when RUNMESH_TEST_DATABASE_URL is
+    # unset, so that `go test ./...` works on a laptop without a database. CI is
+    # exactly where that skip would be a lie, so CI always has one — and
+    # TestDatabaseIsConfiguredInCI fails the build if this service ever stops
+    # being wired up. A green build for a store nobody ran is worse than a red
+    # one.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: runmesh_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+
+    env:
+      RUNMESH_TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/runmesh_test?sslmode=disable
+
     steps:
       - uses: actions/checkout@v4
 
@@ -31,6 +56,11 @@ jobs:
 
       - name: go vet
         run: go vet ./...
+
+      - name: Verify go.mod is tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
 
       - name: Build
         run: go build ./...

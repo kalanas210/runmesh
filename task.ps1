@@ -1,18 +1,27 @@
 #!/usr/bin/env pwsh
 # RunMesh task runner for Windows (GNU make equivalent).
-#   ./task.ps1 build | run | test | race | cover | bench | vet | fmt | lint | check | tidy | clean
+#   ./task.ps1 build | run | test | test-pg | race | cover | bench | vet | fmt
+#                 | lint | check | tidy | clean | db-up | db-down | db-reset
 param([Parameter(Position = 0)][string]$Target = 'help')
 
 $ErrorActionPreference = 'Stop'
 $Binary = 'runmesh'
 $BinDir = 'bin'
 
+# The host port the local PostgreSQL is published on. A native PostgreSQL owns
+# 5432 on a lot of developer machines, so this is overridable and the override
+# reaches both docker compose and the connection string:
+#
+#   $env:RUNMESH_DB_PORT = '5433'; ./task.ps1 test-pg
+if (-not $env:RUNMESH_DB_PORT) { $env:RUNMESH_DB_PORT = '5432' }
+$DbPort = $env:RUNMESH_DB_PORT
+
 # The Go race detector needs cgo and a 64-bit C compiler. A 32-bit MinGW on
 # PATH (a very common Windows setup) fails with "64-bit mode not compiled in",
 # so prefer a known-good x86_64 toolchain when one is installed.
 function Use-RaceToolchain {
     if ($env:RUNMESH_SKIP_CC_DETECT) { return }
-    foreach ($dir in @('C:msys64mingw64in', 'C:mingw64in', 'C:	oolsmingw64in')) {
+    foreach ($dir in @('C:\msys64\mingw64\bin', 'C:\mingw64\bin', 'C:\tools\mingw64\bin')) {
         $gcc = Join-Path $dir 'gcc.exe'
         if (Test-Path $gcc) {
             if ((& $gcc -dumpmachine) -match 'x86_64') {
@@ -40,6 +49,18 @@ switch ($Target) {
     'run'   { go run ./cmd/server }
     'test'  { Invoke-Step 'test' { go test -count=1 ./... } }
     'race'  { Use-RaceToolchain; Invoke-Step 'race' { go test -race -count=1 ./... } }
+    'db-up'    { Invoke-Step 'db-up' { docker compose up -d --wait postgres } }
+    'db-down'  { Invoke-Step 'db-down' { docker compose stop postgres } }
+    'db-reset' { Invoke-Step 'db-reset' { docker compose down -v } }
+    'test-pg' {
+        # The PostgreSQL conformance suite and the crash-recovery test SKIP when
+        # this is unset, so 'test' stays useful without a database. This target
+        # is the one that proves the durable store actually works.
+        & $PSCommandPath db-up
+        Use-RaceToolchain
+        $env:RUNMESH_TEST_DATABASE_URL = "postgres://runmesh:runmesh@127.0.0.1:$DbPort/runmesh?sslmode=disable"
+        Invoke-Step 'test-pg' { go test -race -count=1 ./... }
+    }
     'bench' { Invoke-Step 'bench' { go test -run '^$' -bench . -benchmem ./... } }
     'vet'   { Invoke-Step 'vet' { go vet ./... } }
     'fmt'   { Invoke-Step 'fmt' { gofmt -s -w . } }
@@ -67,6 +88,10 @@ switch ($Target) {
         'run    run the server from source',
         'test   run all tests',
         'race   run all tests under the race detector',
+        'test-pg  the whole suite against the local PostgreSQL',
+        'db-up    start the local PostgreSQL',
+        'db-down  stop it, keeping its data',
+        'db-reset destroy it and its data',
         'cover  tests + HTML coverage report',
         'bench  run benchmarks',
         'vet    go vet',
