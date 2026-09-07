@@ -6,7 +6,7 @@ package runmesh
 import "fmt"
 
 // State is the lifecycle state of a job or of a single step. These are exactly
-// the eight states of the project plan (§8). There is deliberately no BLOCKED
+// the eight lifecycle states. There is deliberately no BLOCKED
 // or PENDING state: "dependencies unsatisfied" is a query predicate (see
 // ClaimRequest), never a stored value, so there is nothing that can drift out
 // of sync with reality.

@@ -42,7 +42,7 @@ type Describer interface{ Describe() Descriptor }
 
 // Validator runs at SUBMIT time, so a malformed plan is a 400 rather than a
 // step that fails three times at runtime an hour later. It is also where
-// per-tool input validation (plan section 33.6) hangs.
+// per-tool input validation hangs.
 type Validator interface {
 	Validate(params json.RawMessage) error
 }

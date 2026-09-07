@@ -10,9 +10,8 @@ import (
 
 // Plan is the SUBMISSION contract. POST /api/v1/jobs decodes into it today,
 // and in Week 5 the Gemini planner produces this exact struct — so validation
-// and persistence are unchanged, and the plan's requirement to validate
-// LLM-generated output (§12, §33.7) is satisfied by code that already exists
-// and is already tested.
+// and persistence are unchanged, and "never trust raw model output" is
+// satisfied by code that already exists and is already tested.
 type Plan struct {
 	Name          string        `json:"name"`
 	Priority      int           `json:"priority,omitempty"`
@@ -75,8 +74,8 @@ func timeoutInRange(sec int, max time.Duration) bool {
 // author is an LLM retrying in a loop than when it is a human.
 //
 // known reports whether a tool name is registered; passing the registry's
-// lookup here is what makes "allowlisted tools" (plan §33.8) a property of
-// submission rather than of execution.
+// lookup here is what makes "allowlisted tools" a property of submission
+// rather than of execution.
 func (p *Plan) Validate(known func(tool string) bool, lim Limits) error {
 	var d []Detail
 	add := func(field, issue string) { d = append(d, Detail{Field: field, Issue: issue}) }

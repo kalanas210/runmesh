@@ -51,7 +51,7 @@ type Config struct {
 	ReconcileInterval time.Duration
 	ReconcileBatch    int
 
-	// Retry (plan section 21)
+	// Retry
 	BackoffBase   time.Duration
 	BackoffMax    time.Duration
 	BackoffFactor float64

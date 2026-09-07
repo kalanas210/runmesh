@@ -37,7 +37,7 @@ type Lease struct {
 	// AttemptID names THIS execution (job.step.N) and becomes the Week-3
 	// Kubernetes Job name. IdempotencyKey is stable across every attempt of
 	// this step; it is the value a side-effecting tool uses so a retry does
-	// not duplicate the effect (plan §22).
+	// not duplicate the effect.
 	AttemptID      string
 	IdempotencyKey string
 
@@ -116,7 +116,7 @@ func AttemptID(jobID, stepID string, attempt int) string {
 }
 
 // IdempotencyKey is STABLE across every attempt of a step. It is the third
-// column of plan §22's UNIQUE(job_id, step_id, idempotency_key): the value a
+// column of UNIQUE(job_id, step_id, idempotency_key): the value a
 // side-effecting tool uses so that a retry does not duplicate the effect.
 //
 // It is a hash rather than the raw pair so it is fixed-width and safe to hand

@@ -18,8 +18,8 @@ func (r Registry) Lookup(name string) (Tool, bool) {
 }
 
 // Has is the allowlist predicate handed to runmesh.Plan.Validate, which is
-// what makes "only registered tools may run" (plan section 33.8) a property of
-// submission rather than of execution.
+// what makes "only registered tools may run" a property of submission rather
+// than of execution.
 func (r Registry) Has(name string) bool {
 	_, ok := r[name]
 	return ok

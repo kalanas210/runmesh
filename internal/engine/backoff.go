@@ -14,7 +14,7 @@ import (
 type Backoff struct {
 	Base   time.Duration // 1s
 	Max    time.Duration // 60s
-	Factor float64       // 2.0 gives 1s, 2s, 4s, 8s (plan section 21)
+	Factor float64       // 2.0 gives 1s, 2s, 4s, 8s
 	Jitter float64       // 0.2 spreads the delay over [d*0.8, d]
 	Rand   func() float64
 }

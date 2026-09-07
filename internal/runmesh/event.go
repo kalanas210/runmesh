@@ -2,7 +2,7 @@ package runmesh
 
 import "time"
 
-// EventType is the vocabulary of the execution timeline (plan §25). It is
+// EventType is the vocabulary of the execution timeline. It is
 // fixed now — including the constants nothing produces yet — so the dashboard's
 // timeline renderer can be written against a stable set and Week 3/4 only add
 // producers, never new concepts.
