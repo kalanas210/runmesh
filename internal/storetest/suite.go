@@ -1,11 +1,25 @@
 // Package storetest is the EXECUTABLE contract for a RunMesh store.
 //
-// internal/memstore passes it in Week 1. internal/pgstore must pass this exact
-// file, unmodified, against a Testcontainers PostgreSQL in Week 2. Every other
-// design in this project argues that its store interface is PostgreSQL-ready;
-// this one makes the claim run, so a divergence between the in-memory
-// simulation and real SKIP LOCKED semantics fails a test instead of surfacing
-// in production three weeks later.
+// internal/memstore passed it in Week 1. internal/pgstore passes it against a
+// real PostgreSQL in Week 2 — every Week-1 case unmodified, and with no change
+// to engine.Store or httpapi.Store, which is the real test of whether a
+// consumer-declared interface was designed or merely described.
+//
+// One case (ListJobsIncludesSteps) was ADDED in Week 2, after a divergence the
+// suite had not thought to cover. Adding it here rather than to one store's own
+// tests is the point: this file is a living contract, and both implementations
+// answer to it.
+//
+// Every other design in this project argues that its interface is
+// PostgreSQL-ready; this one makes the claim run, so a divergence between the
+// in-memory simulation and real SKIP LOCKED semantics fails a test instead of
+// surfacing in production three weeks later.
+//
+// It covers what the two stores do NOT share. The transition policy is one
+// implementation both call (internal/jobstate), so what is left to verify here
+// is exactly the part that genuinely differs: the readiness predicate as SQL,
+// exclusivity under real contention, fencing against a stale token, and paging
+// over rows rather than over a ring.
 //
 // Every case drives time through explicit `now` parameters, so the suite needs
 // no clock, no goroutine and no sleep — which is also why it can run against a
@@ -27,8 +41,8 @@ import (
 )
 
 // Store is the full persistence surface: the union of what the engine needs
-// and what the API needs, plus the two event methods that exist in Week 1 but
-// are not consumed by production code until the Week-2 WebSocket handler.
+// and what the API needs, plus the two event methods that exist now but are not
+// consumed by production code until the Week-6 WebSocket handler.
 type Store interface {
 	engine.Store
 	httpapi.Store
@@ -83,6 +97,7 @@ func RunSuite(t *testing.T, newStore Factory) {
 		{"ReadyHintIsLossy", testReadyHintIsLossy},
 		{"QueueDepthMatchesClaimPredicate", testQueueDepthMatchesClaimPredicate},
 		{"ListJobsPaging", testListJobsPaging},
+		{"ListJobsIncludesSteps", testListJobsIncludesSteps},
 		{"ClosedStoreRejectsEverything", testClosedStoreRejectsEverything},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -928,6 +943,53 @@ func testListJobsPaging(t *testing.T, s Store) {
 	}
 	if len(filtered.Jobs) != 0 {
 		t.Fatalf("state filter returned %d jobs, want 0", len(filtered.Jobs))
+	}
+}
+
+// testListJobsIncludesSteps was added after the fact, and the reason is worth
+// recording: GET /api/v1/jobs renders every job WITH its steps, so a store that
+// paged jobs without loading them returned a different response body from the
+// same endpoint depending on which store was configured. Nothing here caught
+// it, because every existing case checked ids and counts.
+//
+// That is what a conformance suite is for, so the case lives here rather than
+// in one store's own tests — both implementations are held to it, including
+// the one that was already right.
+func testListJobsIncludesSteps(t *testing.T, s Store) {
+	mustCreate(t, s, job(t, "job_a", epoch, map[string][]string{"b": {"a"}}, "a", "b"))
+
+	page, err := s.ListJobs(t.Context(), runmesh.JobFilter{})
+	if err != nil {
+		t.Fatalf("ListJobs: %v", err)
+	}
+	if len(page.Jobs) != 1 {
+		t.Fatalf("ListJobs returned %d jobs, want 1", len(page.Jobs))
+	}
+
+	listed := page.Jobs[0]
+	if len(listed.Steps) != 2 {
+		t.Fatalf("a listed job carries %d steps, want 2: the list endpoint renders "+
+			"them, so a page without them is a different API depending on the store",
+			len(listed.Steps))
+	}
+	// Plan order, not index-scan order: a submitted plan must read back the way
+	// it was written.
+	if listed.Steps[0].ID != "a" || listed.Steps[1].ID != "b" {
+		t.Fatalf("listed steps = [%s %s], want [a b] in plan order",
+			listed.Steps[0].ID, listed.Steps[1].ID)
+	}
+	if listed.Steps[1].DependsOn == nil || listed.Steps[1].DependsOn[0] != "a" {
+		t.Fatalf("listed step b has depends_on %v, want [a]", listed.Steps[1].DependsOn)
+	}
+
+	// And the same job read singly must agree with the listed one.
+	single, err := s.Job(t.Context(), "job_a")
+	if err != nil {
+		t.Fatalf("Job: %v", err)
+	}
+	if len(single.Steps) != len(listed.Steps) {
+		t.Fatalf("Job returned %d steps and ListJobs returned %d for the same job",
+			len(single.Steps), len(listed.Steps))
 	}
 }
 

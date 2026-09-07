@@ -7,14 +7,14 @@ import (
 )
 
 // Sentinel errors returned by any Store implementation. Callers branch on
-// these, so the in-memory store and the Week-2 PostgreSQL store must produce
-// exactly the same ones for the same situations — that is what the shared
-// conformance suite in internal/storetest exists to prove.
+// these, so the in-memory store and the PostgreSQL store must produce exactly
+// the same ones for the same situations — that is what the shared conformance
+// suite in internal/storetest exists to prove, and does.
 var (
 	// ErrNotFound: the job or step does not exist.
 	ErrNotFound = errors.New("runmesh: not found")
 	// ErrConflict: the fencing token matched but the state did not. The
-	// guarded compare-and-set lost. Week 2: UPDATE affected zero rows.
+	// guarded compare-and-set lost. In pgstore: the UPDATE affected zero rows.
 	ErrConflict = errors.New("runmesh: state conflict")
 	// ErrLeaseLost: the fencing token did not match. Somebody else owns this
 	// step now, so the caller must write nothing at all.
@@ -90,7 +90,7 @@ func (e *ToolError) Wrap(err error) *ToolError { e.Err = err; return e }
 
 // ErrorInfo is the persisted, JSON-serialisable projection of a failure. It is
 // deliberately not an error: it is a record that has to round-trip through a
-// jsonb column in Week 2 and through the dashboard in Week 6.
+// jsonb column and through the dashboard in Week 6.
 type ErrorInfo struct {
 	Code      string `json:"code"`
 	Message   string `json:"message"`

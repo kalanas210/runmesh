@@ -18,9 +18,9 @@ var idEnc = base32.NewEncoding("0123456789abcdefghjkmnpqrstvwxyz").
 // "job_0d7k2mq4x9...".
 //
 // Sortability earns its keep twice. GET /jobs?cursor= becomes keyset
-// pagination on the id alone, with no tie-breaker column; and the Week-2
-// PostgreSQL primary-key b-tree appends rather than fragmenting the way a
-// random UUIDv4 does.
+// pagination on the id alone, with no tie-breaker column; and the PostgreSQL
+// primary-key b-tree appends rather than fragmenting the way a random UUIDv4
+// does.
 //
 // now is a parameter rather than a time.Now() call so this package stays pure
 // and the clock purity test needs no exception for it. Fourteen lines of

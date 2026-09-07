@@ -52,7 +52,7 @@ const (
 	CancelStepFailed CancelReason = "step_failed"
 )
 
-// Job maps 1:1 onto the Week-2 jobs row.
+// Job maps 1:1 onto the jobs row in migrations/0001_init.sql.
 type Job struct {
 	ID            string        `json:"id"`
 	Name          string        `json:"name"`
@@ -61,7 +61,7 @@ type Job struct {
 	OnStepFailure FailurePolicy `json:"on_step_failure"`
 	Steps         []*Step       `json:"steps"`
 
-	// IdempotencyKey is UNIQUE in Week 2 and never appears on the wire.
+	// IdempotencyKey carries a partial UNIQUE index and never appears on the wire.
 	IdempotencyKey string `json:"-"`
 
 	// CancelRequestedAt is a FLAG, not a state. The job stays RUNNING while
@@ -83,13 +83,14 @@ type Job struct {
 	// because the API returns it as an ETag and adding a column later is a
 	// migration plus a backfill plus every INSERT in the codebase.
 	Version uint64 `json:"version"`
-	// EventSeq is the per-job event counter. Week 2 bumps it inside the same
-	// UPDATE that writes the transition, which is what keeps Seq gap-free
-	// without a lost-update race between two concurrent appends.
+	// EventSeq is the per-job event counter. Both stores bump it in the same
+	// critical section as the transition — pgstore inside the transaction that
+	// holds the job row — which is what keeps Seq gap-free without a
+	// lost-update race between two concurrent appends.
 	EventSeq uint64 `json:"-"`
 }
 
-// Step maps 1:1 onto the Week-2 job_steps row, PRIMARY KEY (job_id, id).
+// Step maps 1:1 onto the job_steps row, PRIMARY KEY (job_id, id).
 type Step struct {
 	ID        string          `json:"id"` // unique within the job, author-supplied
 	Tool      string          `json:"tool"`

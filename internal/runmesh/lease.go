@@ -8,8 +8,8 @@ import (
 	"time"
 )
 
-// ClaimRequest is, verbatim, the parameter list of the Week-2 SKIP LOCKED
-// query. Now is a PARAMETER rather than a clock read inside the store: that is
+// ClaimRequest is, verbatim, the parameter list of the SKIP LOCKED query in
+// internal/pgstore. Now is a PARAMETER rather than a clock read in the store: that is
 // how you write SQL ($1), and it is what makes every lease-expiry and backoff
 // case in the shared conformance suite a pure function call with no goroutine
 // and no fake clock.

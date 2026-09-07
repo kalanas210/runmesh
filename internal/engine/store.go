@@ -10,8 +10,9 @@ import (
 // Store is declared HERE, by its consumer, rather than exported from the
 // package that implements it.
 //
-// *memstore.Store satisfies it today and *pgstore.Store will satisfy it in
-// Week 2 with no edit to this file. More importantly, the HTTP API declares a
+// *memstore.Store satisfied it in Week 1 and *pgstore.Store satisfies it now,
+// with no edit to this file — which is the test of whether a consumer-declared
+// interface was designed or merely described. More importantly, the API declares a
 // DIFFERENT, narrower interface over the same concrete store — so the API
 // cannot claim, lease, heartbeat or finish anything, and that restriction is
 // enforced by the compiler rather than by code review.
@@ -50,7 +51,7 @@ type Store interface {
 	// Finish applies the terminal (or RETRYING) transition, appends events and
 	// recomputes the job rollup — atomically, in one critical section. Guarded
 	// on the lease id AND the current state; anything else is ErrConflict
-	// (Week 2: the UPDATE affected zero rows) and the worker discards its
+	// (in pgstore: the UPDATE affected zero rows) and the worker discards its
 	// result rather than retrying the write.
 	Finish(ctx context.Context, o runmesh.Outcome) error
 

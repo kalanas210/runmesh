@@ -31,7 +31,7 @@ const (
 // Event is append-only.
 //
 // Seq is per-job, 1-based and gap-free: the cursor for GET /jobs/{id}/events
-// and the Week-2 WebSocket resume token. GlobalSeq is store-wide and strictly
+// and the Week-6 WebSocket resume token. GlobalSeq is store-wide and strictly
 // increasing: the cursor for a dashboard-wide live feed. A reconnecting client
 // drains TailEvents(lastGlobalSeq) and then switches to the live subscription,
 // with no gaps and no duplicates — which is the whole reason there are two
