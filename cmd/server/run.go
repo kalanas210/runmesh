@@ -17,8 +17,51 @@ import (
 	"github.com/kalanas210/runmesh/internal/engine"
 	"github.com/kalanas210/runmesh/internal/httpapi"
 	"github.com/kalanas210/runmesh/internal/memstore"
+	"github.com/kalanas210/runmesh/internal/pgstore"
 	"github.com/kalanas210/runmesh/internal/tools"
 )
+
+// store is the union of what the engine needs and what the API needs, declared
+// HERE — in the one place that has to hold a concrete store — rather than
+// exported by either. memstore and pgstore both satisfy it and neither knows
+// the other exists, which is why swapping them is these twenty lines and not a
+// refactor.
+type store interface {
+	engine.Store
+	httpapi.Store
+	Close() error
+}
+
+// openStore picks the store from configuration.
+//
+// The in-memory store is not a fallback that a misconfiguration can select by
+// accident: it is chosen only by an EMPTY RUNMESH_DATABASE_URL, and a database
+// URL that is set but unreachable fails the boot rather than quietly degrading
+// to a store that loses every job. Silently starting non-durable is how an
+// outage becomes data loss.
+func openStore(ctx context.Context, cfg config.Config, log *slog.Logger) (store, error) {
+	if !cfg.Durable() {
+		return memstore.New(memstore.Options{
+			JobEventBuffer:    cfg.JobEventBuffer,
+			GlobalEventBuffer: cfg.GlobalEventBuffer,
+		}), nil
+	}
+	s, err := pgstore.Open(ctx, cfg.DatabaseURL, pgstore.Options{
+		MaxOpenConns:    cfg.DBMaxOpenConns,
+		MaxIdleConns:    cfg.DBMaxIdleConns,
+		ConnMaxLifetime: cfg.DBConnMaxLifetime,
+		ConnMaxIdleTime: cfg.DBConnMaxIdleTime,
+		ConnectTimeout:  cfg.DBConnectTimeout,
+		Migrate:         cfg.MigrateOnBoot,
+		Log:             log,
+	})
+	if err != nil {
+		return nil, err
+	}
+	log.Info("state is DURABLE", "store", "postgres",
+		"max_open_conns", cfg.DBMaxOpenConns, "migrate_on_boot", cfg.MigrateOnBoot)
+	return s, nil
+}
 
 // version is stamped at build time:
 //
@@ -64,10 +107,11 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 	slog.SetDefault(log)
 
 	clk := clock.System()
-	store := memstore.New(memstore.Options{
-		JobEventBuffer:    cfg.JobEventBuffer,
-		GlobalEventBuffer: cfg.GlobalEventBuffer,
-	})
+	store, err := openStore(ctx, cfg, log)
+	if err != nil {
+		log.Error("could not open the store", "store", cfg.StoreName(), "err", err)
+		return 1
+	}
 	defer func() { _ = store.Close() }()
 
 	registry := tools.Builtins(cfg.EnableTestTools)
@@ -112,18 +156,30 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 		Defaults:        cfg.Defaults,
 		MaxRequestBytes: cfg.MaxRequestBytes,
 		MaxQueueDepth:   cfg.MaxQueueDepth,
-		Durable:         false,
-		StoreName:       "memory",
+		Durable:         cfg.Durable(),
+		StoreName:       cfg.StoreName(),
 	})
 	if err != nil {
 		log.Error("could not build the API", "err", err)
 		return 1
 	}
 
-	// Week 1 answers 201 to a submission as though the job were safe, and it
-	// is not. Saying so once at boot, and again on every readiness probe, is
-	// the difference between a known limitation and a nasty surprise.
-	log.Warn("state is IN MEMORY: a restart loses every job. PostgreSQL arrives in Week 2.")
+	// A permissive default is defensible only if it cannot be held by accident,
+	// so every key that carries no scope restriction is named once at boot.
+	if unscoped := cfg.UnscopedKeyIDs(); len(unscoped) > 0 {
+		log.Warn("API keys with no scope restriction can do anything",
+			"keys", unscoped,
+			"hint", "RUNMESH_API_KEYS=id:jobs.read+jobs.write=<key>")
+	}
+
+	// Answering 201 to a submission as though the job were safe, when it is
+	// not, is the kind of thing that is fine until it is not. Saying so once at
+	// boot, and again on every readiness probe, is the difference between a
+	// known limitation and a nasty surprise.
+	if !cfg.Durable() {
+		log.Warn("state is IN MEMORY: a restart loses every job. " +
+			"Set RUNMESH_DATABASE_URL to run against PostgreSQL.")
+	}
 
 	if err := eng.Start(ctx); err != nil {
 		log.Error("could not start the engine", "err", err)
@@ -175,7 +231,7 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 // is a hard exit: a process that will not stop is worse than one that stops
 // untidily, because an orchestrator has to SIGKILL it and nothing gets to
 // record why.
-func shutdown(srv *http.Server, eng *engine.Engine, store *memstore.Store,
+func shutdown(srv *http.Server, eng *engine.Engine, store store,
 	api *httpapi.API, log *slog.Logger, cfg config.Config) int {
 
 	log.Info("shutdown requested",

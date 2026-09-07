@@ -15,9 +15,10 @@ import (
 // fault tolerance and one that has it.
 //
 // It also runs once at startup, before the dispatcher begins, so a restart
-// reclaims whatever the previous process was holding. In Week 1 the store dies
-// with the process so that sweep finds nothing; in Week 2 it is the whole of
-// crash recovery, and the code path is already written and already tested.
+// reclaims whatever the previous process was holding. Against the in-memory
+// store that sweep finds nothing, because the state died with the process;
+// against PostgreSQL it is the whole of crash recovery, and
+// cmd/server/crash_test.go kills a real server mid-step to prove it.
 func (e *Engine) runReconciler(ctx context.Context) {
 	defer e.wgLoops.Done()
 	tick := e.clock.NewTicker(e.cfg.ReconcileInterval)
