@@ -2,16 +2,15 @@ package memstore
 
 import (
 	"context"
-	"time"
 
 	"github.com/kalanas210/runmesh/internal/runmesh"
 )
 
-// eventRing is a fixed-capacity FIFO. Week 1 keeps events in memory, so the
+// eventRing is a fixed-capacity FIFO. This store keeps events in memory, so the
 // timeline has to be bounded: an unbounded log would make a long-running job a
 // memory leak. Eviction is visible to callers (EventPage.Truncated) rather
-// than silent, and PostgreSQL removes the problem entirely in Week 2 — which
-// is why nothing smarter is being built here.
+// than silent, and pgstore has no such limit — which is why nothing smarter
+// was ever built here.
 type eventRing struct {
 	buf   []runmesh.Event
 	start int
@@ -43,9 +42,9 @@ func (r *eventRing) len() int { return r.n }
 // store-wide rings, and publishes it.
 //
 // Both sequence numbers are assigned here, inside the same critical section as
-// the state change that produced them. That is the whole point: in Week 2 the
-// per-job counter is bumped by the same UPDATE that writes the transition, so
-// two concurrent appends to one job cannot both read the same MAX(seq) and
+// the state change that produced them. That is the whole point, and pgstore
+// does the same inside the transaction that holds the job row: two concurrent
+// appends to one job cannot both read the same counter and
 // produce a duplicate or a gap. A gap-free per-job sequence is what makes it
 // usable as a WebSocket resume cursor.
 //
@@ -69,18 +68,6 @@ func (s *Store) appendEventLocked(j *runmesh.Job, e runmesh.Event) {
 	// so it cannot deadlock, and it guarantees subscribers see events in
 	// GlobalSeq order instead of in goroutine-wakeup order.
 	s.subs.publish(e)
-}
-
-// stepEvent builds an event about one step from its lease context.
-func stepEvent(t runmesh.EventType, s *runmesh.Step, at time.Time) runmesh.Event {
-	return runmesh.Event{
-		StepID:  s.ID,
-		Attempt: s.Attempt,
-		Type:    t,
-		At:      at,
-		State:   s.State,
-		Error:   s.Error.Clone(),
-	}
 }
 
 // JobEvents returns one page of a job's timeline, starting after afterSeq.

@@ -8,7 +8,7 @@ import (
 )
 
 // subscriber is one live event consumer: a test asserting on the exact
-// transition sequence today, the WebSocket fan-out in Week 2.
+// transition sequence today, the WebSocket fan-out in Week 6.
 //
 // The channel has exactly ONE closer. Both the unsubscribe function and
 // Store.Close can end a subscription, and both go through the same sync.Once,

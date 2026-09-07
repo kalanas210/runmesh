@@ -1,19 +1,23 @@
-// Package memstore is the Week-1 store: durable state and the work queue, in
-// memory.
+// Package memstore keeps state and the work queue in memory.
 //
-// It is deliberately written as a faithful simulation of the PostgreSQL store
-// that replaces it in Week 2, not as the simplest thing that could work. Every
-// method is one unit of work with no transaction object crossing the boundary;
-// every timestamp is a parameter rather than a clock read, exactly as a SQL
-// bind variable would be; the claim predicate is the same expression as the
-// SKIP LOCKED query, written in Go; and every read and write deep-copies, so
-// no caller can hold a pointer into store-internal state and pass a test that
-// a real database could never reproduce.
+// It is the DEVELOPMENT store, not a deployment option: a restart loses every
+// job, and the server says so at boot and on every readiness probe. What it
+// buys is a test suite that runs in seconds with nothing installed, and a
+// second implementation to hold internal/pgstore honest.
 //
-// The executable statement of that claim is internal/storetest: the same
-// conformance suite must pass against pgstore in Week 2, unmodified. If it
-// cannot, the interface was wrong — and we find that out from a test run
-// rather than from an argument.
+// It was written as a faithful simulation of the PostgreSQL store rather than
+// as the simplest thing that could work, and that turned out to be the whole
+// reason Week 2 was uneventful. Every method is one unit of work with no
+// transaction object crossing the boundary; every timestamp is a parameter
+// rather than a clock read, exactly as a SQL bind variable is; the claim
+// predicate is the same expression as the SKIP LOCKED query; and every read and
+// write deep-copies, so no caller can hold a pointer into store-internal state
+// and pass a test that a real database could never reproduce.
+//
+// The executable statement of that claim is internal/storetest, which pgstore
+// now passes unmodified. The transition policy itself is no longer duplicated
+// at all: both stores call internal/jobstate, so they cannot disagree about
+// what a failure dooms or what a cancellation touches.
 package memstore
 
 import (
@@ -23,6 +27,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/kalanas210/runmesh/internal/jobstate"
 	"github.com/kalanas210/runmesh/internal/runmesh"
 )
 
@@ -35,8 +40,8 @@ type Options struct {
 // Store is an in-memory implementation of the whole persistence surface.
 //
 // One mutex guards everything. That is not laziness: a single critical section
-// per method is exactly what a single SQL statement gives you in Week 2, so
-// any interleaving that is impossible here is impossible there too. Splitting
+// per method is exactly what one row-locked transaction gives pgstore, so any
+// interleaving that is impossible here is impossible there too. Splitting
 // the lock would buy throughput this store will never need and would introduce
 // interleavings the real store cannot produce.
 type Store struct {
@@ -110,8 +115,8 @@ func (s *Store) Ping(ctx context.Context) error {
 
 // Ready is the dispatcher's wake-up hint. A nil channel would be safe here too
 // — nil blocks forever in select and the ticker carries the load — which is
-// exactly why a PostgreSQL implementation may return nil until LISTEN/NOTIFY
-// is wired up in Week 2.
+// exactly why pgstore's equivalent is only process-local, and why deferring
+// LISTEN/NOTIFY to Week 6 costs latency and never correctness.
 func (s *Store) Ready() <-chan struct{} { return s.ready }
 
 // signalReady is a non-blocking send performed AFTER the mutex is released, so
@@ -192,7 +197,7 @@ func (s *Store) Job(ctx context.Context, id string) (*runmesh.Job, error) {
 //
 // Ordering is by id descending. That works because ids are k-sortable, which
 // makes keyset pagination need no tie-breaker column and no OFFSET — the same
-// query shape as the Week-2 index scan. Sorting on read is O(n log n) and
+// query shape as pgstore's index scan. Sorting on read is O(n log n) and
 // perfectly adequate for an in-memory store whose entire lifetime is one
 // process; PostgreSQL does it with the primary-key index.
 func (s *Store) ListJobs(ctx context.Context, f runmesh.JobFilter) (runmesh.JobPage, error) {
@@ -244,8 +249,8 @@ func (s *Store) ListJobs(ctx context.Context, f runmesh.JobFilter) (runmesh.JobP
 //
 // It deliberately does NOT touch SCHEDULED or RUNNING steps: a worker owns
 // those, and they learn to stop through their next heartbeat. That is the only
-// mechanism that still works in Week 2, when the cancelling API call may land
-// on a different replica from the one executing the step.
+// mechanism that still works now that the cancelling API call may land on a
+// different replica from the one executing the step.
 //
 // The job therefore stays RUNNING until those steps drain, and the API returns
 // the honest current state rather than a comfortable lie about being stopped.
@@ -301,7 +306,7 @@ func (s *Store) QueueDepth(ctx context.Context, now time.Time) (int, error) {
 	n := 0
 	for _, j := range s.jobs {
 		for _, step := range j.Steps {
-			if claimable(j, step, now, nil) {
+			if jobstate.Claimable(j, step, now, nil) {
 				n++
 			}
 		}
@@ -309,7 +314,7 @@ func (s *Store) QueueDepth(ctx context.Context, now time.Time) (int, error) {
 	return n, nil
 }
 
-// Stats is a snapshot for GET /api/v1/ready and, in Week 2, for the metrics
+// Stats is a snapshot for GET /api/v1/ready and, in Week 6, for the metrics
 // exporter.
 type Stats struct {
 	Jobs          int
@@ -329,7 +334,7 @@ func (s *Store) Snapshot(now time.Time) Stats {
 			if step.State.Active() {
 				st.ActiveSteps++
 			}
-			if claimable(j, step, now, nil) {
+			if jobstate.Claimable(j, step, now, nil) {
 				st.QueueDepth++
 			}
 		}
@@ -347,23 +352,9 @@ func (s *Store) lookupLocked(l runmesh.Lease) (*runmesh.Job, *runmesh.Step, erro
 	if !ok {
 		return nil, nil, runmesh.ErrNotFound
 	}
-	step := j.Step(l.StepID)
-	if step == nil {
-		return nil, nil, runmesh.ErrNotFound
-	}
-	if step.LeaseID == "" || step.LeaseID != l.ID {
-		return nil, nil, fmt.Errorf("%w: step %s/%s", runmesh.ErrLeaseLost, l.JobID, l.StepID)
+	step, err := jobstate.Lookup(j, l)
+	if err != nil {
+		return nil, nil, err
 	}
 	return j, step, nil
-}
-
-// stateGuard rejects a transition the state machine does not allow. It is the
-// third of the three redundant gates: the guarded write is the real
-// enforcement, CanStep is data a table test walks, and this is where the two
-// meet on every single mutation.
-func stateGuard(step *runmesh.Step, to runmesh.State) error {
-	if !runmesh.CanStep(step.State, to) {
-		return fmt.Errorf("%w: step is %s, cannot move to %s", runmesh.ErrConflict, step.State, to)
-	}
-	return nil
 }

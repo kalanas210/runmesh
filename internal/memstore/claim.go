@@ -4,54 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"sort"
-	"time"
 
+	"github.com/kalanas210/runmesh/internal/jobstate"
 	"github.com/kalanas210/runmesh/internal/runmesh"
 )
-
-// claimable is THE readiness predicate, and it is the same expression as the
-// Week-2 SKIP LOCKED query written in Go:
-//
-//	job.cancel_requested_at IS NULL
-//	AND job.state IN ('QUEUED','RUNNING')
-//	AND step.state IN ('QUEUED','RETRYING')
-//	AND step.next_attempt_at <= $now
-//	AND (step.lease_expires_at IS NULL OR step.lease_expires_at <= $now)
-//	AND NOT EXISTS (SELECT 1 FROM job_steps d
-//	                 WHERE d.job_id = s.job_id AND d.id = ANY(s.depends_on)
-//	                   AND d.state <> 'SUCCEEDED')
-//
-// Readiness is a predicate, never a stored state. There is no BLOCKED state,
-// no materialised pending-dependency counter that can drift, and therefore no
-// "who unblocks this step" question to get wrong: a step becomes claimable the
-// instant its last dependency succeeds, because that is what the query says.
-func claimable(j *runmesh.Job, s *runmesh.Step, now time.Time, tools map[string]bool) bool {
-	if j.CancelRequestedAt != nil {
-		return false
-	}
-	if j.State != runmesh.Queued && j.State != runmesh.Running {
-		return false
-	}
-	if s.State != runmesh.Queued && s.State != runmesh.Retrying {
-		return false
-	}
-	if s.NextAttemptAt.After(now) {
-		return false
-	}
-	if !s.LeaseExpiresAt.IsZero() && s.LeaseExpiresAt.After(now) {
-		return false
-	}
-	if len(tools) > 0 && !tools[s.Tool] {
-		return false
-	}
-	for _, dep := range s.DependsOn {
-		d := j.Step(dep)
-		if d == nil || d.State != runmesh.Succeeded {
-			return false
-		}
-	}
-	return true
-}
 
 // candidate pairs a claimable step with its job for ordering.
 type candidate struct {
@@ -93,7 +49,7 @@ func (s *Store) Claim(ctx context.Context, req runmesh.ClaimRequest) ([]runmesh.
 	var cands []candidate
 	for _, j := range s.jobs {
 		for _, step := range j.Steps {
-			if claimable(j, step, req.Now, tools) {
+			if jobstate.Claimable(j, step, req.Now, tools) {
 				cands = append(cands, candidate{j, step})
 			}
 		}
@@ -149,7 +105,7 @@ func (s *Store) claimOneLocked(j *runmesh.Job, step *runmesh.Step, req runmesh.C
 	step.Error = nil
 	step.Version++
 
-	s.appendEventLocked(j, stepEvent(runmesh.StepScheduled, step, req.Now))
+	s.appendEventLocked(j, jobstate.StepEvent(runmesh.StepScheduled, step, req.Now))
 	s.reconcileJobLocked(j, req.Now)
 
 	return runmesh.Lease{
