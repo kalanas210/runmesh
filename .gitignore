@@ -32,3 +32,26 @@ Thumbs.db
 node_modules/
 .next/
 out/
+
+# Local assistant / editor state — machine-local, never committed
+.claude/
+.claude*/
+CLAUDE.md
+CLAUDE.local.md
+.mcp.json
+.cursor/
+.cursorrules
+.aider*
+.continue/
+.windsurf/
+.github-copilot/
+.anthropic/
+.codeium/
+
+# Agent transcripts, session logs and scratch output
+*.session.json
+*.transcript
+*.transcript.jsonl
+transcripts/
+scratchpad/
+.scratch/
