@@ -80,6 +80,21 @@ type Config struct {
 	JobEventBuffer    int // per-job event ring, in-memory store only
 	GlobalEventBuffer int // store-wide event ring, in-memory store only
 
+	// Executor selects where tools run: "local" (this process) or
+	// "kubernetes" (one Job per attempt). It is the Week-1 seam being used.
+	Executor string
+
+	// Kubernetes. Read only when Executor is "kubernetes".
+	K8sNamespace          string
+	K8sImage              string
+	K8sTaskServiceAccount string
+	K8sKubeconfig         string
+	K8sContext            string
+	K8sTTLAfterFinished   time.Duration
+	K8sDeadlineGrace      time.Duration
+	K8sPollInterval       time.Duration
+	K8sCleanupTimeout     time.Duration
+
 	// Tools
 	EnableTestTools bool
 	MaxOutputBytes  int
@@ -153,6 +168,17 @@ func Load(getenv func(string) string) (Config, error) {
 
 		JobEventBuffer:    l.num("RUNMESH_JOB_EVENT_BUFFER", 512),
 		GlobalEventBuffer: l.num("RUNMESH_GLOBAL_EVENT_BUFFER", 8192),
+
+		Executor:              l.str("RUNMESH_EXECUTOR", ExecutorLocal),
+		K8sNamespace:          l.str("RUNMESH_K8S_NAMESPACE", "runmesh-tasks"),
+		K8sImage:              l.str("RUNMESH_K8S_IMAGE", ""),
+		K8sTaskServiceAccount: l.str("RUNMESH_K8S_TASK_SERVICE_ACCOUNT", "runmesh-task"),
+		K8sKubeconfig:         l.str("RUNMESH_K8S_KUBECONFIG", ""),
+		K8sContext:            l.str("RUNMESH_K8S_CONTEXT", ""),
+		K8sTTLAfterFinished:   l.dur("RUNMESH_K8S_TTL_AFTER_FINISHED", 5*time.Minute),
+		K8sDeadlineGrace:      l.dur("RUNMESH_K8S_DEADLINE_GRACE", time.Minute),
+		K8sPollInterval:       l.dur("RUNMESH_K8S_POLL_INTERVAL", 500*time.Millisecond),
+		K8sCleanupTimeout:     l.dur("RUNMESH_K8S_CLEANUP_TIMEOUT", 15*time.Second),
 
 		EnableTestTools: l.boolean("RUNMESH_ENABLE_TEST_TOOLS", false),
 		MaxOutputBytes:  l.num("RUNMESH_MAX_OUTPUT_BYTES", 64<<10),
@@ -284,6 +310,37 @@ func (c Config) Validate() []error {
 	if c.GlobalEventBuffer < 1 {
 		bad("RUNMESH_GLOBAL_EVENT_BUFFER must be >= 1, got %d", c.GlobalEventBuffer)
 	}
+	switch c.Executor {
+	case ExecutorLocal:
+	case ExecutorKubernetes:
+		if c.K8sNamespace == "" {
+			bad("RUNMESH_K8S_NAMESPACE is required when RUNMESH_EXECUTOR=kubernetes")
+		}
+		if c.K8sImage == "" {
+			bad("RUNMESH_K8S_IMAGE is required when RUNMESH_EXECUTOR=kubernetes: " +
+				"a tool that names no image of its own has nothing to run")
+		}
+		if c.K8sPollInterval <= 0 {
+			bad("RUNMESH_K8S_POLL_INTERVAL must be > 0, got %s", c.K8sPollInterval)
+		}
+		// The Kubernetes deadline is a BACKSTOP and must be strictly looser
+		// than RunMesh's own, or the two race — and Kubernetes winning replaces
+		// a classified TIMED_OUT carrying a timeline entry with an opaque
+		// DeadlineExceeded.
+		if c.K8sDeadlineGrace <= 0 {
+			bad("RUNMESH_K8S_DEADLINE_GRACE must be > 0, got %s: the Kubernetes "+
+				"deadline has to outlast RunMesh's own, not tie with it", c.K8sDeadlineGrace)
+		}
+		// A cleanup that outlives the drain would still be deleting workloads
+		// after the process claims to have stopped.
+		if c.K8sCleanupTimeout <= 0 || c.K8sCleanupTimeout >= c.DrainTimeout {
+			bad("RUNMESH_K8S_CLEANUP_TIMEOUT must be in (0, RUNMESH_DRAIN_TIMEOUT=%s), got %s",
+				c.DrainTimeout, c.K8sCleanupTimeout)
+		}
+	default:
+		bad("RUNMESH_EXECUTOR must be %q or %q, got %q",
+			ExecutorLocal, ExecutorKubernetes, c.Executor)
+	}
 	if c.MaxOutputBytes < 1 {
 		bad("RUNMESH_MAX_OUTPUT_BYTES must be >= 1, got %d", c.MaxOutputBytes)
 	}
@@ -297,6 +354,16 @@ func (c Config) Validate() []error {
 	}
 	return errs
 }
+
+// The two places a tool can run. The seam between them was declared in Week 1
+// as tools.Executor; this is the configuration that finally uses it.
+const (
+	ExecutorLocal      = "local"
+	ExecutorKubernetes = "kubernetes"
+)
+
+// RunsInKubernetes reports whether steps execute as Kubernetes Jobs.
+func (c Config) RunsInKubernetes() bool { return c.Executor == ExecutorKubernetes }
 
 // dbConnHeadroom is how many connections the pool must hold beyond the worker
 // pool: one for the dispatcher, one for the reconciler, and two for concurrent

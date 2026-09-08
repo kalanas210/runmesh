@@ -16,6 +16,7 @@ import (
 	"github.com/kalanas210/runmesh/internal/config"
 	"github.com/kalanas210/runmesh/internal/engine"
 	"github.com/kalanas210/runmesh/internal/httpapi"
+	"github.com/kalanas210/runmesh/internal/k8s"
 	"github.com/kalanas210/runmesh/internal/memstore"
 	"github.com/kalanas210/runmesh/internal/pgstore"
 	"github.com/kalanas210/runmesh/internal/tools"
@@ -30,6 +31,58 @@ type store interface {
 	engine.Store
 	httpapi.Store
 	Close() error
+}
+
+// newExecutor picks where tools run.
+//
+// This is the Week-1 seam being cashed in. tools.Local and *k8s.Executor
+// satisfy the same one-method interface, so choosing between them is these
+// twenty lines — the dispatcher, worker pool, lease handling, heartbeats,
+// classification and state machine are identical either way, and none of them
+// knows which one it got.
+func newExecutor(cfg config.Config, registry tools.Registry,
+	clk clock.Clock, log *slog.Logger) (tools.Executor, error) {
+
+	if !cfg.RunsInKubernetes() {
+		return tools.Local{
+			Registry:       registry,
+			MaxOutputBytes: cfg.MaxOutputBytes,
+			Log:            log,
+		}, nil
+	}
+
+	client, err := k8s.NewClient(cfg.K8sKubeconfig, cfg.K8sContext)
+	if err != nil {
+		return nil, err
+	}
+	exec, err := k8s.NewExecutor(client, k8s.Config{
+		Namespace:          cfg.K8sNamespace,
+		Image:              cfg.K8sImage,
+		TaskServiceAccount: cfg.K8sTaskServiceAccount,
+		TTLAfterFinished:   cfg.K8sTTLAfterFinished,
+		DeadlineGrace:      cfg.K8sDeadlineGrace,
+		PollInterval:       cfg.K8sPollInterval,
+		MaxLogBytes:        cfg.MaxOutputBytes,
+		CleanupTimeout:     cfg.K8sCleanupTimeout,
+		Owner:              cfg.Owner,
+	}, clk, log)
+	if err != nil {
+		return nil, err
+	}
+	log.Info("executing steps as Kubernetes Jobs",
+		"namespace", cfg.K8sNamespace, "image", cfg.K8sImage,
+		"task_service_account", cfg.K8sTaskServiceAccount)
+	return exec, nil
+}
+
+// executionMode is what GET /api/v1/tools reports. A registry describing its
+// tools as in_process while every one of them runs in a pod would be a
+// documentation bug that the dashboard and the Week-5 planner both inherit.
+func executionMode(cfg config.Config) tools.ExecutionMode {
+	if cfg.RunsInKubernetes() {
+		return tools.ModeContainer
+	}
+	return tools.ModeInProcess
 }
 
 // openStore picks the store from configuration.
@@ -115,10 +168,10 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 	defer func() { _ = store.Close() }()
 
 	registry := tools.Builtins(cfg.EnableTestTools)
-	executor := tools.Local{
-		Registry:       registry,
-		MaxOutputBytes: cfg.MaxOutputBytes,
-		Log:            log,
+	executor, err := newExecutor(cfg, registry, clk, log)
+	if err != nil {
+		log.Error("could not build the executor", "executor", cfg.Executor, "err", err)
+		return 1
 	}
 
 	eng, err := engine.New(engine.Config{
@@ -158,6 +211,7 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 		MaxQueueDepth:   cfg.MaxQueueDepth,
 		Durable:         cfg.Durable(),
 		StoreName:       cfg.StoreName(),
+		ExecutionMode:   executionMode(cfg),
 	})
 	if err != nil {
 		log.Error("could not build the API", "err", err)

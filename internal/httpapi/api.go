@@ -44,8 +44,15 @@ type Deps struct {
 	// Durable reports whether the backing store survives a restart. Week 1
 	// says false, loudly, on GET /ready.
 	Durable bool
-	// StoreName appears in the readiness body: "memory" now, "postgres" later.
+	// StoreName appears in the readiness body: "memory" or "postgres".
 	StoreName string
+
+	// ExecutionMode is where tools actually run. The registry's own
+	// descriptors cannot know: the same echo tool is in_process under the
+	// local executor and container under the Kubernetes one, and serving the
+	// wrong answer would mislead the dashboard and, in Week 5, the planner
+	// that is handed these descriptors as function declarations.
+	ExecutionMode tools.ExecutionMode
 }
 
 // API holds the handler dependencies. It is unexported state behind a
@@ -59,6 +66,7 @@ type API struct {
 
 	limits        runmesh.Limits
 	defaults      runmesh.Defaults
+	executionMode tools.ExecutionMode
 	maxQueueDepth int
 	durable       bool
 	storeName     string
@@ -89,6 +97,9 @@ func New(d Deps) (http.Handler, *API, error) {
 	if d.StoreName == "" {
 		d.StoreName = "memory"
 	}
+	if d.ExecutionMode == "" {
+		d.ExecutionMode = tools.ModeInProcess
+	}
 
 	a := &API{
 		store:         d.Store,
@@ -98,6 +109,7 @@ func New(d Deps) (http.Handler, *API, error) {
 		log:           d.Log.With("component", "httpapi"),
 		limits:        d.Limits,
 		defaults:      d.Defaults,
+		executionMode: d.ExecutionMode,
 		maxQueueDepth: d.MaxQueueDepth,
 		durable:       d.Durable,
 		storeName:     d.StoreName,
@@ -223,7 +235,11 @@ func (a *API) isDraining() bool {
 // In Week 5 this same descriptor list is what Gemini is given as its function
 // declarations, which is why input_schema is served verbatim.
 func (a *API) listTools(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, a.log, http.StatusOK, toolsResponse{Tools: a.tools.Descriptors()})
+	descriptors := a.tools.Descriptors()
+	for i := range descriptors {
+		descriptors[i].Execution = a.executionMode
+	}
+	writeJSON(w, a.log, http.StatusOK, toolsResponse{Tools: descriptors})
 }
 
 // health is liveness: is this process running at all. It must not depend on
