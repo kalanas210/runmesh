@@ -9,6 +9,7 @@
 package httpapi
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/kalanas210/runmesh/internal/clock"
 	"github.com/kalanas210/runmesh/internal/config"
+	"github.com/kalanas210/runmesh/internal/planner"
 	"github.com/kalanas210/runmesh/internal/runmesh"
 	"github.com/kalanas210/runmesh/internal/tools"
 )
@@ -62,6 +64,20 @@ type Deps struct {
 	// It is the same object the engine holds, which is what makes the two
 	// answers identical by construction rather than by review.
 	Sandbox Policy
+
+	// Planner turns a goal into a validated plan. Optional: a deployment with
+	// no planner still serves every other route, and the two planning
+	// endpoints answer 501 rather than 404 — the difference between "this
+	// server does not do that" and "you got the URL wrong" is worth a status
+	// code.
+	Planner Planner
+}
+
+// Planner is the slice of internal/planner the API needs, declared here as an
+// interface for the same reason Runtime and Policy are: httpapi imports the
+// planner package for its Goal and Trace types, and nothing else.
+type Planner interface {
+	Plan(ctx context.Context, goal planner.Goal) (planner.Result, error)
 }
 
 // Policy is the slice of the execution policy the API needs. Declared here as
@@ -86,6 +102,7 @@ type API struct {
 	limits        runmesh.Limits
 	defaults      runmesh.Defaults
 	policy        Policy
+	planner       Planner
 	executionMode tools.ExecutionMode
 	maxQueueDepth int
 	durable       bool
@@ -130,6 +147,7 @@ func New(d Deps) (http.Handler, *API, error) {
 		limits:        d.Limits,
 		defaults:      d.Defaults,
 		policy:        d.Sandbox,
+		planner:       d.Planner,
 		executionMode: d.ExecutionMode,
 		maxQueueDepth: d.MaxQueueDepth,
 		durable:       d.Durable,
@@ -193,6 +211,12 @@ func (a *API) routes() []route {
 		{"POST /api/v1/jobs/{id}/cancel", config.ScopeJobsCancel, a.cancelJob},
 		{"GET /api/v1/jobs/{id}/events", config.ScopeJobsRead, a.jobEvents},
 		{"GET /api/v1/tools", config.ScopeJobsRead, a.listTools},
+
+		// The planning endpoints. Both require jobs.write, including the dry
+		// run: /plans executes nothing, but it spends model tokens, and a
+		// capability that costs money is a write however little it changes.
+		{"POST /api/v1/plans", config.ScopeJobsWrite, a.createPlan},
+		{"POST /api/v1/goals", config.ScopeJobsWrite, a.createGoal},
 
 		// The probes carry no credential: a load balancer must be able to ask
 		// whether this process is alive and ready without holding one.

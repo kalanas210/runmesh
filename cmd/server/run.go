@@ -15,10 +15,12 @@ import (
 	"github.com/kalanas210/runmesh/internal/clock"
 	"github.com/kalanas210/runmesh/internal/config"
 	"github.com/kalanas210/runmesh/internal/engine"
+	"github.com/kalanas210/runmesh/internal/gemini"
 	"github.com/kalanas210/runmesh/internal/httpapi"
 	"github.com/kalanas210/runmesh/internal/k8s"
 	"github.com/kalanas210/runmesh/internal/memstore"
 	"github.com/kalanas210/runmesh/internal/pgstore"
+	"github.com/kalanas210/runmesh/internal/planner"
 	"github.com/kalanas210/runmesh/internal/policy"
 	"github.com/kalanas210/runmesh/internal/tools"
 )
@@ -143,6 +145,66 @@ func logPolicy(log *slog.Logger, cfg config.Config, sandbox policy.Sandbox) {
 			"runmesh.io/network=allow may reach addresses outside the cluster. " +
 			"This is enforced by the NetworkPolicy in deploy/kubernetes, which " +
 			"requires a CNI that implements it - kindnet does not.")
+	}
+}
+
+// newPlanner builds the goal-to-plan pipeline, or returns nil.
+//
+// nil is a supported outcome and not a failure: a deployment with no planner
+// serves every other route unchanged, and POST /api/v1/plans and /api/v1/goals
+// answer 501 naming the variable. That is why the default is "none" rather than
+// "heuristic" — a planning endpoint that quietly answers with rules over
+// keywords, in a deployment where somebody believed they had configured a model,
+// is a worse outcome than an honest refusal.
+func newPlanner(cfg config.Config, sandbox policy.Sandbox, log *slog.Logger) (httpapi.Planner, error) {
+	pcfg := planner.Config{
+		MaxSteps:       cfg.PlannerMaxSteps,
+		MaxRepairs:     cfg.PlannerMaxRepairs,
+		DefaultTimeout: cfg.PlannerStepTimeout,
+		Log:            log,
+	}
+
+	switch cfg.Planner {
+	case config.PlannerNone:
+		return nil, nil
+
+	case config.PlannerHeuristic:
+		log.Warn("the planner is HEURISTIC: plans are built by rules over the goal " +
+			"text, not by a model. Set RUNMESH_PLANNER=gemini with an API key for " +
+			"actual planning.")
+		return planner.NewHeuristic(sandbox, pcfg), nil
+
+	case config.PlannerGemini:
+		client, err := gemini.New(gemini.Config{
+			APIKey:          cfg.GeminiAPIKey,
+			Model:           cfg.GeminiModel,
+			BaseURL:         cfg.GeminiBaseURL,
+			Timeout:         cfg.GeminiTimeout,
+			MaxOutputTokens: cfg.GeminiMaxTokens,
+			Temperature:     cfg.GeminiTemperature,
+			Log:             log,
+		})
+		if err != nil {
+			return nil, err
+		}
+		// The runtime's own plan limits are handed to the planner, so it
+		// validates against exactly what the API will validate against. A
+		// planner holding looser limits than the endpoint it feeds is a
+		// machine for producing 400s.
+		p, err := planner.New(planner.FromGemini(client), sandbox, cfg.Limits, pcfg)
+		if err != nil {
+			return nil, err
+		}
+		log.Info("planning with Gemini",
+			"model", cfg.GeminiModel,
+			"max_steps", cfg.PlannerMaxSteps, "max_repairs", cfg.PlannerMaxRepairs)
+		return p, nil
+
+	default:
+		// config.Validate has already rejected this; the branch exists so a
+		// future planner added to the constants without being added here is a
+		// boot failure rather than a silent "none".
+		return nil, fmt.Errorf("unknown planner %q", cfg.Planner)
 	}
 }
 
@@ -284,10 +346,17 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 		return 1
 	}
 
+	plannerImpl, err := newPlanner(cfg, sandbox, log)
+	if err != nil {
+		log.Error("could not build the planner", "planner", cfg.Planner, "err", err)
+		return 2
+	}
+
 	handler, api, err := httpapi.New(httpapi.Deps{
 		Store:           store,
 		Tools:           registry,
 		Sandbox:         sandbox,
+		Planner:         plannerImpl,
 		Runtime:         eng,
 		Clock:           clk,
 		Log:             log,

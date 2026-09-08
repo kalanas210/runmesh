@@ -21,6 +21,10 @@ func scopedFixture(t *testing.T, scopes ...config.Scope) *fixture {
 		d.APIKeys = map[[32]byte]config.APIKey{
 			config.KeyDigest(apiKey): {ID: "scoped", Scopes: set},
 		}
+		// A planner, so the planning routes reach their handlers when the
+		// scope allows it. Without one they would answer 501 for every scope,
+		// and the matrix would report green for a route it never exercised.
+		d.Planner = &stubPlanner{result: sampleResult()}
 	})
 }
 
@@ -50,6 +54,11 @@ func TestScopeMatrix(t *testing.T) {
 		{"events", http.MethodGet, "/api/v1/jobs/job_missing/events", "", config.ScopeJobsRead},
 		{"cancel", http.MethodPost, "/api/v1/jobs/job_missing/cancel", "", config.ScopeJobsCancel},
 		{"tools", http.MethodGet, "/api/v1/tools", "", config.ScopeJobsRead},
+		// Both planning routes need jobs.write, the dry run included: it
+		// executes nothing but it spends model tokens, and a capability that
+		// costs money is a write however little it changes.
+		{"plan", http.MethodPost, "/api/v1/plans", `{"goal":"x"}`, config.ScopeJobsWrite},
+		{"goal", http.MethodPost, "/api/v1/goals", `{"goal":"x"}`, config.ScopeJobsWrite},
 	}
 
 	for _, c := range calls {

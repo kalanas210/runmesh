@@ -608,8 +608,8 @@ func TestListTools(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
 		t.Fatalf("decode tools: %v", err)
 	}
-	if len(out.Tools) != 3 {
-		t.Fatalf("%d tools, want echo, fail and sleep", len(out.Tools))
+	if len(out.Tools) != 4 {
+		t.Fatalf("%d tools, want echo, fail, report_generate and sleep", len(out.Tools))
 	}
 	for _, tool := range out.Tools {
 		// The schema is served verbatim because it becomes the Gemini function

@@ -42,6 +42,11 @@ func Builtins(opt Options) Registry {
 	r := Registry{
 		"echo":  Echo{},
 		"sleep": Sleep{},
+		// The join at the bottom of a plan: pure formatting over results other
+		// steps produced. Always registered, because it needs nothing — no
+		// image, no network, no execution — and because a planner with no way
+		// to present an answer produces plans that end in a fetch.
+		"report_generate": Report{},
 	}
 	if opt.EnableTestTools {
 		r["fail"] = Fail{}

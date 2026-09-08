@@ -21,6 +21,16 @@ const (
 	CodeFailedPrecondition = "failed_precondition"
 	CodeResourceExhausted  = "resource_exhausted"
 	CodeInternal           = "internal"
+	// CodeUnprocessable: the request was well-formed and the runtime could not
+	// produce a result from it. It carries a 422 rather than a 400 because the
+	// caller's input was fine — a goal the planner could not turn into a valid
+	// plan is not a malformed request, and telling a client to "fix the syntax"
+	// of a perfectly good sentence sends it in the wrong direction.
+	CodeUnprocessable = "unprocessable"
+	// CodeUnimplemented: this deployment does not have the feature. 501, not
+	// 500: nothing is broken, and no retry will help until an operator
+	// configures it.
+	CodeUnimplemented = "unimplemented"
 )
 
 // APIError is the one and only non-2xx body shape. Never a bare string, never
@@ -122,6 +132,13 @@ func classifyError(err error) (int, APIError) {
 		return http.StatusRequestEntityTooLarge, APIError{
 			Code:    CodeInvalidArgument,
 			Message: "the request body is too large",
+		}
+
+	case errors.Is(err, errNoPlanner):
+		return http.StatusNotImplemented, APIError{
+			Code: CodeUnimplemented,
+			Message: "this deployment has no planner configured; " +
+				"submit a plan to POST /api/v1/jobs, or set RUNMESH_PLANNER",
 		}
 
 	case errors.As(err, new(*badRequestError)):

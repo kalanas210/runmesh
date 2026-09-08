@@ -67,34 +67,20 @@ func (a *API) createJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	now := a.clock.Now()
-
-	// Admission control before persistence: a runtime that accepts unbounded
-	// work is a runtime that falls over politely instead of pushing back.
-	depth, err := a.store.QueueDepth(r.Context(), now)
+	stored, replayed, err := a.submitPlan(r, &plan)
 	if err != nil {
+		if errors.Is(err, runmesh.ErrQueueFull) {
+			w.Header().Set("Retry-After", "1")
+		}
 		writeError(w, r, a.log, err)
 		return
 	}
-	if a.maxQueueDepth > 0 && depth+len(plan.Steps) > a.maxQueueDepth {
-		w.Header().Set("Retry-After", "1")
-		writeError(w, r, a.log, fmt.Errorf("%w: depth %d", runmesh.ErrQueueFull, depth))
-		return
-	}
-
-	job := plan.Build(runmesh.NewID("job_", now), now, a.defaults)
-
-	stored, err := a.store.CreateJob(r.Context(), job, idemKey)
-	switch {
-	case errors.Is(err, runmesh.ErrDuplicate):
+	if replayed {
 		// A replay is not an error. Returning the original job with 200 is what
 		// makes a client's retry after a network timeout safe.
 		w.Header().Set("Idempotency-Replayed", "true")
 		w.Header().Set("Location", "/api/v1/jobs/"+stored.ID)
 		writeJSON(w, a.log, http.StatusOK, toJobResponse(stored))
-		return
-	case err != nil:
-		writeError(w, r, a.log, err)
 		return
 	}
 
@@ -104,6 +90,38 @@ func (a *API) createJob(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Location", "/api/v1/jobs/"+stored.ID)
 	writeJSON(w, a.log, http.StatusCreated, toJobResponse(stored))
+}
+
+// submitPlan is admission and persistence, shared by POST /api/v1/jobs and
+// POST /api/v1/goals.
+//
+// It is factored out precisely so a generated plan cannot take a different
+// route in. Admission control, id minting, the defaults, the idempotency
+// replay: a model-authored plan gets all of them because it is the same
+// function, not because somebody remembered to add them to a second handler.
+func (a *API) submitPlan(r *http.Request, plan *runmesh.Plan) (job *runmesh.Job, replayed bool, err error) {
+	now := a.clock.Now()
+
+	// Admission control before persistence: a runtime that accepts unbounded
+	// work is a runtime that falls over politely instead of pushing back.
+	depth, err := a.store.QueueDepth(r.Context(), now)
+	if err != nil {
+		return nil, false, err
+	}
+	if a.maxQueueDepth > 0 && depth+len(plan.Steps) > a.maxQueueDepth {
+		return nil, false, fmt.Errorf("%w: depth %d", runmesh.ErrQueueFull, depth)
+	}
+
+	built := plan.Build(runmesh.NewID("job_", now), now, a.defaults)
+
+	stored, err := a.store.CreateJob(r.Context(), built, r.Header.Get("Idempotency-Key"))
+	switch {
+	case errors.Is(err, runmesh.ErrDuplicate):
+		return stored, true, nil
+	case err != nil:
+		return nil, false, err
+	}
+	return stored, false, nil
 }
 
 // listJobs is GET /api/v1/jobs, with keyset pagination.

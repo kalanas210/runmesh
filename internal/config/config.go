@@ -128,6 +128,20 @@ type Config struct {
 	TaskImage   string
 	PythonImage string
 
+	// Planner. Selects who turns a goal into a plan: "none" (the planning
+	// endpoints answer 501), "heuristic" (rules over the goal text, no API key
+	// and no spend), or "gemini".
+	Planner            string
+	GeminiAPIKey       string
+	GeminiModel        string
+	GeminiBaseURL      string
+	GeminiTimeout      time.Duration
+	GeminiMaxTokens    int
+	GeminiTemperature  float64
+	PlannerMaxSteps    int
+	PlannerMaxRepairs  int
+	PlannerStepTimeout time.Duration
+
 	// Observability
 	LogLevel  slog.Level
 	LogFormat string // "json" or "text"
@@ -239,6 +253,24 @@ func Load(getenv func(string) string) (Config, error) {
 		MaxOutputBytes:  l.num("RUNMESH_MAX_OUTPUT_BYTES", 64<<10),
 		TaskImage:       l.str("RUNMESH_TASK_IMAGE", ""),
 		PythonImage:     l.str("RUNMESH_PYTHON_IMAGE", ""),
+
+		// "none" by default, not "heuristic". A planning endpoint that silently
+		// answers with rules-over-keywords when an operator believed they had
+		// configured a model is a worse outcome than a 501 naming the
+		// variable, and RUNMESH_PLANNER is set once per deployment.
+		Planner:         l.str("RUNMESH_PLANNER", PlannerNone),
+		GeminiAPIKey:    l.str("RUNMESH_GEMINI_API_KEY", ""),
+		GeminiModel:     l.str("RUNMESH_GEMINI_MODEL", "gemini-2.0-flash"),
+		GeminiBaseURL:   l.str("RUNMESH_GEMINI_BASE_URL", ""),
+		GeminiTimeout:   l.dur("RUNMESH_GEMINI_TIMEOUT", 30*time.Second),
+		GeminiMaxTokens: l.num("RUNMESH_GEMINI_MAX_OUTPUT_TOKENS", 8192),
+		// Zero, and deliberately. Planning is not a creative task: the same
+		// goal against the same catalogue should produce the same DAG, because
+		// a plan that varies run to run cannot be reviewed or cached.
+		GeminiTemperature:  l.float("RUNMESH_GEMINI_TEMPERATURE", 0),
+		PlannerMaxSteps:    l.num("RUNMESH_PLANNER_MAX_STEPS", 12),
+		PlannerMaxRepairs:  l.num("RUNMESH_PLANNER_MAX_REPAIRS", 2),
+		PlannerStepTimeout: l.dur("RUNMESH_PLANNER_STEP_TIMEOUT", 60*time.Second),
 
 		LogLevel:  l.level("RUNMESH_LOG_LEVEL", slog.LevelInfo),
 		LogFormat: l.str("RUNMESH_LOG_FORMAT", "json"),
@@ -444,6 +476,48 @@ func (c Config) Validate() []error {
 	if c.MaxRequestBytes < 1 {
 		bad("RUNMESH_MAX_REQUEST_BYTES must be >= 1, got %d", c.MaxRequestBytes)
 	}
+	switch c.Planner {
+	case PlannerNone, PlannerHeuristic:
+	case PlannerGemini:
+		if c.GeminiAPIKey == "" {
+			bad("RUNMESH_GEMINI_API_KEY is required when RUNMESH_PLANNER=gemini")
+		}
+		if c.GeminiModel == "" {
+			bad("RUNMESH_GEMINI_MODEL must not be empty")
+		}
+		if c.GeminiTimeout <= 0 {
+			bad("RUNMESH_GEMINI_TIMEOUT must be > 0, got %s", c.GeminiTimeout)
+		}
+		if c.GeminiMaxTokens < 256 {
+			bad("RUNMESH_GEMINI_MAX_OUTPUT_TOKENS must be >= 256, got %d: a plan "+
+				"cut off mid-JSON is reported as a truncation, and every one of "+
+				"them costs a full round trip", c.GeminiMaxTokens)
+		}
+		if c.GeminiTemperature < 0 || c.GeminiTemperature > 2 {
+			bad("RUNMESH_GEMINI_TEMPERATURE must be in [0, 2], got %v", c.GeminiTemperature)
+		}
+	default:
+		bad("RUNMESH_PLANNER must be %q, %q or %q, got %q",
+			PlannerNone, PlannerHeuristic, PlannerGemini, c.Planner)
+	}
+	if c.PlannerMaxSteps < 1 {
+		bad("RUNMESH_PLANNER_MAX_STEPS must be >= 1, got %d", c.PlannerMaxSteps)
+	}
+	if c.PlannerMaxSteps > c.Limits.MaxSteps {
+		bad("RUNMESH_PLANNER_MAX_STEPS (%d) must not exceed RUNMESH_MAX_STEPS (%d): "+
+			"a planner allowed to produce plans the API will reject is a machine "+
+			"for producing 400s", c.PlannerMaxSteps, c.Limits.MaxSteps)
+	}
+	if c.PlannerMaxRepairs < 0 || c.PlannerMaxRepairs > 5 {
+		bad("RUNMESH_PLANNER_MAX_REPAIRS must be in [0, 5], got %d: a model that "+
+			"cannot produce a valid plan given the schema, the catalogue and an "+
+			"explicit list of what was wrong will not manage it on the sixth try",
+			c.PlannerMaxRepairs)
+	}
+	if c.PlannerStepTimeout <= 0 || c.PlannerStepTimeout > c.Limits.MaxStepTimeout {
+		bad("RUNMESH_PLANNER_STEP_TIMEOUT must be in (0, RUNMESH_MAX_STEP_TIMEOUT=%s], got %s",
+			c.Limits.MaxStepTimeout, c.PlannerStepTimeout)
+	}
 	switch c.LogFormat {
 	case "json", "text":
 	default:
@@ -451,6 +525,20 @@ func (c Config) Validate() []error {
 	}
 	return errs
 }
+
+// Who turns a goal into a plan.
+//
+// PlannerHeuristic is not an "offline model" and does not pretend to be: it is
+// a handful of rules over the words in the goal. It exists so the whole path —
+// goal, plan, validation, DAG, execution — works on a laptop with no API key
+// and no billing account, which is the plan's own instruction, and so that the
+// end-to-end tests of that path are assertions rather than samples of a model's
+// mood.
+const (
+	PlannerNone      = "none"
+	PlannerHeuristic = "heuristic"
+	PlannerGemini    = "gemini"
+)
 
 // The two places a tool can run. The seam between them was declared in Week 1
 // as tools.Executor; this is the configuration that finally uses it.

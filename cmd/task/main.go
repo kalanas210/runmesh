@@ -35,10 +35,12 @@
 // under an at-least-once contract, silently retrying what nobody classified is
 // how a side-effecting tool runs three times.
 //
-// It imports nothing from the rest of the repository, deliberately. The marker
-// comes from the environment rather than from a shared constant, so this binary
-// stays a few hundred kilobytes instead of linking client-go — and so an image
-// written in any other language is a first-class citizen of the same contract.
+// It imports nothing from the rest of the repository except internal/report,
+// which is stdlib-only and is a Markdown renderer rather than any part of the
+// contract. The marker still comes from the environment rather than from a
+// shared constant, so this binary stays a few hundred kilobytes instead of
+// linking client-go — and so an image written in any other language is a
+// first-class citizen of the same contract.
 package main
 
 import (
@@ -47,6 +49,8 @@ import (
 	"os"
 	"strconv"
 	"time"
+
+	"github.com/kalanas210/runmesh/internal/report"
 )
 
 const defaultMarker = "##RUNMESH-RESULT##"
@@ -119,6 +123,28 @@ func dispatch(tool string, params map[string]any, getenv func(string) string,
 		// activeDeadlineSeconds both bound it from outside.
 		time.Sleep(d)
 		return map[string]any{"slept_ms": d.Milliseconds()}, 0
+
+	case "report_generate":
+		// The one tool whose renderer is shared with the in-process registry,
+		// through internal/report. See that package for why this single import
+		// does not weaken the "cmd/task imports nothing" argument: the CONTRACT
+		// is still environment in, marker line out, and the package is
+		// stdlib-only. What it buys is one Markdown renderer instead of two
+		// that drift until a plan produces a different report depending on
+		// where it ran.
+		var opts report.Options
+		if raw := getenv("RUNMESH_PARAMS"); raw != "" {
+			if err := json.Unmarshal([]byte(raw), &opts); err != nil {
+				fmt.Fprintf(stderr, "task: report_generate params: %v\n", err)
+				return nil, 2
+			}
+		}
+		if err := opts.Validate(); err != nil {
+			fmt.Fprintf(stderr, "task: report_generate params: %v\n", err)
+			return nil, 2
+		}
+		return report.Render(opts, rawDeps(getenv("RUNMESH_DEPS")),
+			getenv("RUNMESH_JOB_ID"), getenv("RUNMESH_STEP_ID")), 0
 
 	case "http_request":
 		// The only tool that touches the network, and the reason the sandbox

@@ -504,8 +504,9 @@ func TestEndToEndToolRegistry(t *testing.T) {
 	if err := json.Unmarshal(body, &out); err != nil {
 		t.Fatalf("decode tools: %v", err)
 	}
-	if len(out.Tools) != 3 {
-		t.Fatalf("registry has %d tools, want echo, sleep and fail", len(out.Tools))
+	if len(out.Tools) != 4 {
+		t.Fatalf("registry has %d tools, want echo, sleep, fail and report_generate",
+			len(out.Tools))
 	}
 	for _, tool := range out.Tools {
 		if tool.Version == "" || len(tool.InputSchema) == 0 || tool.Execution == "" {
