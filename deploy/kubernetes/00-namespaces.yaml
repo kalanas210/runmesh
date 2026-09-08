@@ -24,6 +24,13 @@ metadata:
   labels:
     app.kubernetes.io/name: runmesh
     app.kubernetes.io/component: tasks
-    # Week 4 hangs the sandbox NetworkPolicy off this namespace, and Calico is
-    # already installed so that the policy will actually be enforced rather
-    # than accepted and ignored. See deploy/kind/cluster.yaml.
+    # The sandbox NetworkPolicy in 20-networkpolicy.yaml hangs off this
+    # namespace. Calico is installed rather than kind's default CNI so that the
+    # policy is actually enforced rather than accepted and ignored — see
+    # deploy/kind/cluster.yaml — and deploy/kind/verify-networkpolicy.sh proves
+    # it with real pods rather than believing the manifest.
+    #
+    # kubernetes.io/metadata.name is set automatically by the API server on
+    # every namespace, and the DNS egress rule selects kube-system with it. It
+    # is not repeated here because a label the control plane maintains is more
+    # trustworthy than a copy somebody has to remember to keep.

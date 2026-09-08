@@ -50,7 +50,7 @@ func newFixture(t *testing.T, opts ...func(*httpapi.Deps)) *fixture {
 
 	deps := httpapi.Deps{
 		Store:   f.store,
-		Tools:   tools.Builtins(true),
+		Tools:   tools.Builtins(tools.Options{EnableTestTools: true}),
 		Runtime: stubRuntime{inflight: 2, workers: 8},
 		Clock:   f.clk,
 		Log:     slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError})),

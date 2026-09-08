@@ -19,6 +19,7 @@ import (
 	"github.com/kalanas210/runmesh/internal/k8s"
 	"github.com/kalanas210/runmesh/internal/memstore"
 	"github.com/kalanas210/runmesh/internal/pgstore"
+	"github.com/kalanas210/runmesh/internal/policy"
 	"github.com/kalanas210/runmesh/internal/tools"
 )
 
@@ -65,6 +66,9 @@ func newExecutor(cfg config.Config, registry tools.Registry,
 		MaxLogBytes:        cfg.MaxOutputBytes,
 		CleanupTimeout:     cfg.K8sCleanupTimeout,
 		Owner:              cfg.Owner,
+		RunAsUser:          cfg.K8sRunAsUser,
+		RunAsGroup:         cfg.K8sRunAsGroup,
+		TerminationGrace:   cfg.K8sTerminationGrace,
 	}, clk, log)
 	if err != nil {
 		return nil, err
@@ -73,6 +77,73 @@ func newExecutor(cfg config.Config, registry tools.Registry,
 		"namespace", cfg.K8sNamespace, "image", cfg.K8sImage,
 		"task_service_account", cfg.K8sTaskServiceAccount)
 	return exec, nil
+}
+
+// newSandbox builds the execution policy: the operator's ceiling on what any
+// tool may have, paired with the registry it applies to.
+//
+// It is a hard boot failure when it does not build. A runtime that starts
+// without a policy is a runtime executing model-authored plans with whatever
+// limits the plans asked for, which is the one outcome Week 4 exists to make
+// impossible.
+func newSandbox(cfg config.Config, registry tools.Registry) (policy.Sandbox, error) {
+	eng, err := policy.New(policy.Config{
+		Mode:                    executionMode(cfg),
+		DefaultCPU:              cfg.PolicyDefaultCPU,
+		DefaultMemory:           cfg.PolicyDefaultMemory,
+		DefaultEphemeralStorage: cfg.PolicyDefaultEphemeralStorage,
+		MaxCPU:                  cfg.PolicyMaxCPU,
+		MaxMemory:               cfg.PolicyMaxMemory,
+		MaxEphemeralStorage:     cfg.PolicyMaxEphemeralStorage,
+		// The plan-level ceilings are reused rather than duplicated as two more
+		// variables. A step cannot be submitted above them, so a second, larger
+		// policy ceiling would be dead configuration, and a second, smaller one
+		// would silently contradict the 400 the API already returns.
+		MaxTimeout:         cfg.Limits.MaxStepTimeout,
+		MaxAttempts:        cfg.Limits.MaxAttempts,
+		AllowNetwork:       cfg.PolicyAllowNetwork,
+		AllowTools:         cfg.PolicyAllowTools,
+		DenyTools:          cfg.PolicyDenyTools,
+		AllowImagePrefixes: cfg.PolicyImagePrefixes,
+		DefaultImage:       cfg.K8sImage,
+	})
+	if err != nil {
+		return policy.Sandbox{}, err
+	}
+	return policy.NewSandbox(registry, eng), nil
+}
+
+// logPolicy states the sandbox once at boot, and names anything refused.
+//
+// A tool that is registered but denied is the single most confusing state this
+// system has — plans 400 with a reason nobody reads, and the tool is right
+// there in the catalogue — so it is said out loud at startup, with the reason,
+// rather than left to be discovered from a rejected submission.
+func logPolicy(log *slog.Logger, cfg config.Config, sandbox policy.Sandbox) {
+	var denied []string
+	for _, d := range sandbox.Descriptors() {
+		if d.Denied {
+			denied = append(denied, d.Name+" ("+d.DeniedReason+")")
+		}
+	}
+	log.Info("execution policy",
+		"mode", string(sandbox.Mode()),
+		"default_cpu", cfg.PolicyDefaultCPU,
+		"default_memory", cfg.PolicyDefaultMemory,
+		"max_cpu", cfg.PolicyMaxCPU,
+		"max_memory", cfg.PolicyMaxMemory,
+		"max_ephemeral_storage", cfg.PolicyMaxEphemeralStorage,
+		"network_allowed", cfg.PolicyAllowNetwork,
+		"tools", sandbox.Registry().Names())
+	if len(denied) > 0 {
+		log.Warn("tools registered but refused by policy", "tools", denied)
+	}
+	if cfg.PolicyAllowNetwork {
+		log.Warn("network tools are ENABLED: task pods labelled " +
+			"runmesh.io/network=allow may reach addresses outside the cluster. " +
+			"This is enforced by the NetworkPolicy in deploy/kubernetes, which " +
+			"requires a CNI that implements it - kindnet does not.")
+	}
 }
 
 // executionMode is what GET /api/v1/tools reports. A registry describing its
@@ -167,12 +238,27 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 	}
 	defer func() { _ = store.Close() }()
 
-	registry := tools.Builtins(cfg.EnableTestTools)
+	registry := tools.Builtins(tools.Options{
+		EnableTestTools: cfg.EnableTestTools,
+		TaskImage:       cfg.TaskImage,
+		PythonImage:     cfg.PythonImage,
+	})
 	executor, err := newExecutor(cfg, registry, clk, log)
 	if err != nil {
 		log.Error("could not build the executor", "executor", cfg.Executor, "err", err)
 		return 1
 	}
+
+	// The execution policy, built once and shared by the API (submit-time
+	// refusals), the engine (per-attempt limits) and GET /api/v1/tools (the
+	// catalogue the Week-5 planner reads). One object, so the three cannot
+	// disagree about what a tool is allowed to do.
+	sandbox, err := newSandbox(cfg, registry)
+	if err != nil {
+		log.Error("could not build the execution policy", "err", err)
+		return 2
+	}
+	logPolicy(log, cfg, sandbox)
 
 	eng, err := engine.New(engine.Config{
 		Owner:             cfg.Owner,
@@ -192,7 +278,7 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 			Factor: cfg.BackoffFactor,
 			Jitter: cfg.BackoffJitter,
 		},
-	}, engine.Deps{Store: store, Executor: executor, Clock: clk, Log: log})
+	}, engine.Deps{Store: store, Executor: executor, Sandbox: sandbox, Clock: clk, Log: log})
 	if err != nil {
 		log.Error("could not build the engine", "err", err)
 		return 1
@@ -201,6 +287,7 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 	handler, api, err := httpapi.New(httpapi.Deps{
 		Store:           store,
 		Tools:           registry,
+		Sandbox:         sandbox,
 		Runtime:         eng,
 		Clock:           clk,
 		Log:             log,

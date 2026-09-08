@@ -41,11 +41,27 @@ type harness struct {
 	used   []bool
 }
 
-type option func(*engine.Config)
+// option mutates the engine's configuration OR its dependencies before
+// construction. Both, because the execution policy arrived in Week 4 as a
+// dependency rather than a config field, and a test that needs to deny a tool
+// needs to reach it.
+type option func(*engine.Config, *engine.Deps)
 
-func withWorkers(n int) option { return func(c *engine.Config) { c.Workers = n; c.ClaimBatch = n } }
+func withWorkers(n int) option {
+	return func(c *engine.Config, _ *engine.Deps) { c.Workers = n; c.ClaimBatch = n }
+}
 
-func withBackoff(b engine.Backoff) option { return func(c *engine.Config) { c.Backoff = b } }
+func withBackoff(b engine.Backoff) option {
+	return func(c *engine.Config, _ *engine.Deps) { c.Backoff = b }
+}
+
+func withSandbox(s engine.Sandbox) option {
+	return func(_ *engine.Config, d *engine.Deps) { d.Sandbox = s }
+}
+
+func withExecutor(e tools.Executor) option {
+	return func(_ *engine.Config, d *engine.Deps) { d.Executor = e }
+}
 
 func newHarness(t *testing.T, reg tools.Registry, opts ...option) *harness {
 	t.Helper()
@@ -83,16 +99,17 @@ func newHarness(t *testing.T, reg tools.Registry, opts ...option) *harness {
 		ReconcileBatch:    100,
 		Backoff:           engine.Backoff{Base: time.Second, Max: time.Minute, Factor: 2},
 	}
-	for _, o := range opts {
-		o(&cfg)
-	}
-
-	eng, err := engine.New(cfg, engine.Deps{
+	deps := engine.Deps{
 		Store:    h.store,
 		Executor: tools.Local{Registry: reg, MaxOutputBytes: 1 << 20, Log: quietLogger()},
 		Clock:    h.clk,
 		Log:      quietLogger(),
-	})
+	}
+	for _, o := range opts {
+		o(&cfg, &deps)
+	}
+
+	eng, err := engine.New(cfg, deps)
 	if err != nil {
 		t.Fatalf("engine.New: %v", err)
 	}

@@ -46,6 +46,24 @@ const (
 	CodeOutputTooLarge = "output_too_large"
 	CodeDepFailed      = "dependency_failed"
 	CodeShutdown       = "shutdown_drain"
+
+	// The execution policy's own codes. They are terminal by construction: no
+	// number of retries turns a refusal by policy into permission, and a step
+	// that keeps retrying one hides the misconfiguration that caused it.
+	//
+	// CodeToolDenied: the tool is not on the operator's allowlist, or is on
+	// the denylist.
+	CodeToolDenied = "tool_denied"
+	// CodeToolNotSandboxed: the tool must run in a container and this
+	// deployment executes tools in-process.
+	CodeToolNotSandboxed = "tool_not_sandboxed"
+	// CodeNetworkDenied: the tool asks for egress and this deployment does not
+	// grant it to any tool.
+	CodeNetworkDenied = "network_denied"
+	// CodePolicyViolation: the resolved sandbox is not one the operator's
+	// configuration permits — an unparseable quantity, or an image outside the
+	// allowed prefixes.
+	CodePolicyViolation = "policy_violation"
 )
 
 // ToolError is how a tool declares retryability. Anything else a tool returns

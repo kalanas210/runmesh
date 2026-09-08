@@ -23,15 +23,17 @@ User goal ──▶ planner ──▶ validated plan ──▶ RunMesh ──▶
 
 ---
 
-## Status: Week 2 of 6
+## Status: Week 4 of 6
 
 | | |
 |---|---|
 | **Working now** | HTTP API, step DAG, worker pool, per-step timeouts, cancellation, retries with backoff, leases + reconciler, execution timeline, graceful shutdown |
 | **Durable** | PostgreSQL state and a `SKIP LOCKED` queue. A killed process loses nothing: its leases expire and another replica finishes the work |
+| **Isolated** | One Kubernetes Job per attempt, `backoffLimit: 0`. Non-root, read-only root filesystem, all capabilities dropped, seccomp, cpu/memory/ephemeral limits, and a default-deny NetworkPolicy — with a script that proves the policy is enforced rather than merely applied |
+| **Governed** | An execution policy an LLM-authored plan cannot widen: the tool asks, the operator grants, and the grant is resolved on **every attempt** ([ADR 0010](docs/decisions/0010-the-plan-asks-the-operator-grants.md)) |
 | **Auth** | Scoped API keys — `jobs.read`, `jobs.write`, `jobs.cancel`, `admin` |
-| **Dependencies** | **One direct:** the PostgreSQL driver, imported in exactly one file, reached only through `database/sql` ([ADR 0007](docs/decisions/0007-one-dependency-the-postgres-driver.md)) |
-| **Tests** | 139 tests, 329 cases, all green under `-race`; 84% of statements. Includes the store conformance suite and a crash-recovery test against real PostgreSQL |
+| **Dependencies** | The PostgreSQL driver and `client-go`. The driver is imported in exactly one file, reached only through `database/sql` ([ADR 0007](docs/decisions/0007-one-dependency-the-postgres-driver.md)); `client-go` is confined to `internal/k8s` |
+| **Tests** | 215 tests, 388 cases, all green under `-race`. 92% of the policy engine, 88% of the API, 84% of the engine. Includes the store conformance suite, a crash-recovery test against real PostgreSQL, and a test that reads the shipped NetworkPolicy manifests and fails if they stop matching the labels the code sets |
 
 Without `RUNMESH_DATABASE_URL` the server still runs on the in-memory store for
 development — and says so, loudly, at boot and in `GET /api/v1/ready`
@@ -46,8 +48,8 @@ into data loss.
 |---|---|
 | 1 ✅ | Go API, job/step DAG, worker pool, retries, leases, cancellation, timeouts |
 | 2 ✅ | PostgreSQL state + `SKIP LOCKED` queue, real crash recovery, scoped API keys |
-| 3 | Docker, `kind` + Calico, Kubernetes Job execution via `client-go`, RBAC |
-| 4 | Tool sandbox: resource limits, non-root, NetworkPolicy, execution policy |
+| 3 ✅ | Docker, `kind` + Calico, Kubernetes Job execution via `client-go`, RBAC |
+| 4 ✅ | Tool sandbox: resource limits, non-root, NetworkPolicy, execution policy |
 | 5 | Gemini planner, structured output → schema validation → policy validation |
 | 6 | Next.js dashboard with the execution waterfall, Prometheus, k6, benchmarks |
 
@@ -403,6 +405,87 @@ then asserts the crash spent exactly **one** unit of retry budget, because a
 worker that reliably dies on one step has to exhaust `max_attempts` rather than
 crash-loop the fleet — while a graceful drain, asserted beside it, spends none.
 
+### What Week 4 actually changed
+
+Week 3 put every step in its own pod. Week 4 is about what that pod may do —
+and about the two ways a security control gets to be fictional.
+
+**The first fiction: limits nobody applies.** The tool descriptors had carried
+`cpu`, `memory` and `image` since Week 1, and nothing read them. The engine built
+each attempt's limits from the step's timeout and attempt budget alone, so every
+Job was created with no resource limits at all: the descriptors said `500m`, and
+the pods got the node. Copying the descriptor's numbers into the pod spec would
+have fixed the symptom and encoded something worse — *the thing being executed
+decides how much of the machine it gets* — one week before a language model
+starts writing the thing being executed.
+
+So [`internal/policy`](internal/policy) sits between them. A descriptor is a
+**request**; the operator's configuration is the **grant**; the effective
+envelope is `min(request, ceiling)`, defaulted, never widened. Resources clamp
+silently — a portable descriptor meeting a smaller cluster should run smaller,
+not fail — while capabilities refuse loudly, with a classified terminal error
+naming the switch to flip. It is resolved on **every attempt**, not once at
+submission, so a policy tightened while a step sits behind a retry backoff binds
+the very next attempt rather than only new work.
+
+**The second fiction: a policy the CNI ignores.** kind's default CNI accepts
+`NetworkPolicy` objects and enforces nothing. `kubectl get networkpolicy` lists
+them, `describe` prints the rules, no event is emitted, and every packet flows.
+Every observable signal reports success.
+
+That is why the sandbox has three independent mechanisms rather than one:
+
+```
+deploy/kubernetes/20-networkpolicy.yaml   default-deny for every task pod;
+                                          egress only for runmesh.io/network=allow,
+                                          to 0.0.0.0/0 EXCEPT RFC 1918 and 169.254/16
+deploy/kind/verify-networkpolicy.sh       four real pods, real packets. The fourth
+                                          probe is the one worth having: an allowed
+                                          pod must NOT reach the cluster's own API
+internal/k8s/sandbox_test.go              reads the shipped manifests and fails if
+                                          the label Go sets stops matching the
+                                          selector the YAML uses — a drift that
+                                          leaves pods matching NO policy, which
+                                          Kubernetes treats as unrestricted
+cmd/task/http.go                          the tool refuses to connect to any
+                                          non-public address itself, checked in the
+                                          dialer AFTER DNS resolution, so rebinding
+                                          does not help and every redirect is covered
+```
+
+`169.254.169.254` is why the `except` list exists at all: on EC2, GCE and Azure
+it hands out the node's cloud credentials to anything that asks, over plain HTTP,
+with no authentication. An egress rule of `0.0.0.0/0` with no exclusions passes
+every other check and is a direct path from "the model chose to fetch a URL" to
+the cluster's cloud identity.
+
+**And `python_execute`, which is the point of all of it.** The Python image ships
+an ordinary, unrestricted CPython: real builtins, real imports, the whole
+standard library. There is no stripped `__builtins__`, no import audit, no AST
+filter — every one of those has been bypassed publicly, and a filter that
+*mostly* works is worse than none, because it manufactures the belief that the
+code was vetted. The sandbox is the pod, and the interpreter inside it is assumed
+hostile ([ADR 0009](docs/decisions/0009-the-sandbox-is-the-pod.md)). A test fails
+if somebody later adds a content filter to the parameter validator.
+
+The pod spec is asserted field by field, because every one of these is a line
+that can be deleted without breaking anything else, and the effect of deleting it
+is invisible until it matters:
+
+```
+runAsNonRoot + runAsUser 65532        set at BOTH pod and container level: a
+                                      container securityContext REPLACES the pod's
+readOnlyRootFilesystem                nothing to modify, nothing to persist
+capabilities: drop [ALL]              a list that ages vs. one that does not
+allowPrivilegeEscalation: false       no setuid path out
+seccompProfile: RuntimeDefault        omitting it means Unconfined
+cpu / memory / ephemeral-storage      the third takes a NODE down, not a pod:
+                                      container logs count towards it
+emptyDir at /tmp with a sizeLimit     the only writable path, and it is quota'd
+automountServiceAccountToken: false   plus a ServiceAccount bound to nothing
+enableServiceLinks: false             no free map of the namespace in the env
+```
+
 ### Testing
 
 ```bash
@@ -489,7 +572,19 @@ unauthenticated must not be something a forgotten variable can cause.
 Cross-field invariants are checked too, each because violating it produces a
 *subtle* failure rather than an obvious one — a heartbeat interval that leaves
 fewer than three beats per lease, a store timeout that outlives the drain it is
-part of, an abandon grace longer than the lease it is protecting.
+part of, an abandon grace longer than the lease it is protecting, a task uid of
+`0` that `runAsNonRoot` would have every pod rejected for at admission.
+
+The execution policy is configuration too, and its defaults are closed: no
+network for any tool, `250m` / `128Mi` / `64Mi` for a tool that declares nothing,
+and no `python_execute` at all until an image is named for it. A tool registered
+with no image would pass plan validation and then fail every attempt; absent is
+the honest answer, and the 400 says `unknown_tool` and lists what *is* available.
+
+What is deliberately **not** configurable: `runAsNonRoot`, the read-only root
+filesystem, the dropped capabilities, the seccomp profile. A security control an
+operator can switch off with an environment variable is a security control that
+will be switched off with an environment variable.
 
 ---
 
@@ -506,15 +601,23 @@ internal/
   storetest/         the conformance suite both stores pass, unmodified
   engine/            dispatcher, worker pool, reconciler, and the pure policy
   tools/             the plugin boundary and the Executor seam for Kubernetes
+  k8s/               one Job per attempt; the only package that imports client-go
+  policy/            the execution policy: the tool asks, the operator grants
   httpapi/           net/http only; its own narrower view of the store
   config/            every knob, validated at boot
+cmd/task/            the container tool contract, implemented. No RunMesh imports
 migrations/          the schema, embedded in the binary
+deploy/
+  docker/            the server, task and Python-sandbox images
+  kind/              the local cluster, and the script that proves the sandbox
+  kubernetes/        namespaces, least-privilege RBAC, the NetworkPolicies
 docs/
   architecture/      diagrams and the map of where the engineering is
   decisions/         ADRs for the choices with real alternatives
 ```
 
-Thirteen packages, one binary, one direct dependency (and the five it brings).
+Fifteen packages, two binaries, two direct dependencies — and `client-go` reaches
+exactly one of the fifteen.
 
 ### Design records
 
@@ -526,6 +629,8 @@ Thirteen packages, one binary, one direct dependency (and the five it brings).
 - [0006 — Readiness is a predicate, not a state](docs/decisions/0006-readiness-is-derived.md)
 - [0007 — One dependency: the PostgreSQL driver](docs/decisions/0007-one-dependency-the-postgres-driver.md)
 - [0008 — The job row is the lock](docs/decisions/0008-the-job-row-is-the-lock.md)
+- [0009 — The sandbox is the pod, not the interpreter](docs/decisions/0009-the-sandbox-is-the-pod.md)
+- [0010 — The plan asks; the operator grants](docs/decisions/0010-the-plan-asks-the-operator-grants.md)
 
 ---
 

@@ -60,6 +60,17 @@ type Config struct {
 
 	// Owner labels the workloads this process created.
 	Owner string
+
+	// RunAsUser, RunAsGroup and TerminationGrace parameterise the pod security
+	// context. They are the only parts of the hardening that are configurable:
+	// runAsNonRoot, the read-only root filesystem, the dropped capabilities and
+	// the seccomp profile are properties of BuildJob and cannot be switched off
+	// by configuration, because a security control an operator can disable with
+	// an environment variable is a security control that will be disabled with
+	// an environment variable.
+	RunAsUser        int64
+	RunAsGroup       int64
+	TerminationGrace time.Duration
 }
 
 func (c *Config) setDefaults() {
@@ -80,6 +91,15 @@ func (c *Config) setDefaults() {
 	}
 	if c.CleanupTimeout <= 0 {
 		c.CleanupTimeout = 15 * time.Second
+	}
+	if c.RunAsUser < 1 {
+		c.RunAsUser = defaultNonRootUID
+	}
+	if c.RunAsGroup < 1 {
+		c.RunAsGroup = defaultNonRootGID
+	}
+	if c.TerminationGrace <= 0 {
+		c.TerminationGrace = defaultTerminationGrace
 	}
 }
 

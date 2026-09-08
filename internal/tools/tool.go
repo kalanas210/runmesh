@@ -56,22 +56,35 @@ const (
 	ModeContainer ExecutionMode = "container"  // Week 3: a Kubernetes Job
 )
 
-// Limits are carried in Week 1; only Timeout, MaxAttempts and MaxOutputBytes
-// are read. CPU, Memory, Image and Network exist now so that Week 3's Job spec
-// is a translation of a value that already exists, rather than a new concept
-// threaded through five layers under time pressure.
+// Limits are the security envelope of one attempt.
+//
+// A descriptor's Limits are a REQUEST, not a grant. What actually reaches the
+// pod is whatever internal/policy resolved: the tool's request clamped by the
+// operator's ceiling, with the operator's defaults filled in. That is the
+// difference between "the tool declares 500m" and "the tool gets 500m", and it
+// is why a plan — which in Week 5 is written by a language model — cannot widen
+// its own sandbox.
 type Limits struct {
 	Timeout        time.Duration `json:"-"`
 	MaxAttempts    int           `json:"max_attempts"`
 	MaxOutputBytes int           `json:"max_output_bytes"`
 	CPU            string        `json:"cpu,omitempty"`    // "500m"
 	Memory         string        `json:"memory,omitempty"` // "256Mi"
-	Image          string        `json:"image,omitempty"`
-	Network        bool          `json:"network"`
+	// EphemeralStorage caps the writable scratch a task gets. The root
+	// filesystem is read-only, so this sizes the /tmp emptyDir — the one place
+	// a task may write, and therefore the one place it can fill a node's disk
+	// from.
+	EphemeralStorage string `json:"ephemeral_storage,omitempty"` // "64Mi"
+	Image            string `json:"image,omitempty"`
+	// Network is the tool's request for egress. Denied unless the operator has
+	// switched network tools on; see policy.Config.AllowNetwork. The pod label
+	// derived from this value is what the sandbox NetworkPolicy selects on, so
+	// it is enforced by the CNI and not only by the tool's own manners.
+	Network bool `json:"network"`
 }
 
-// Descriptor is what GET /api/v1/tools serves and, in Week 5, what is handed
-// to Gemini as a function declaration.
+// Descriptor is what GET /api/v1/tools serves and what is handed to Gemini as
+// a function declaration in Week 5.
 type Descriptor struct {
 	Name        string          `json:"name"`
 	Version     string          `json:"version"`
@@ -79,6 +92,14 @@ type Descriptor struct {
 	InputSchema json.RawMessage `json:"input_schema"`
 	Limits      Limits          `json:"limits"`
 	Execution   ExecutionMode   `json:"execution"`
+
+	// Denied and DeniedReason are filled in by internal/policy when this
+	// deployment refuses the tool. A denied tool is still LISTED, because the
+	// alternative — omitting it — makes "unknown_tool" the only evidence that
+	// python_execute exists but is switched off, and gives the Week-5 planner
+	// nothing it can act on.
+	Denied       bool   `json:"denied,omitempty"`
+	DeniedReason string `json:"denied_reason,omitempty"`
 }
 
 // Input is everything a tool is allowed to know.

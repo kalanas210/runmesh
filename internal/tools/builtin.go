@@ -9,6 +9,22 @@ import (
 	"github.com/kalanas210/runmesh/internal/runmesh"
 )
 
+// Options select which tools this deployment registers, and with what images.
+//
+// Images are configuration rather than constants because the image a tool runs
+// is a deployment fact — a local kind tag, a registry digest in production —
+// and baking one into the descriptor would make the registry lie in every
+// environment but one.
+type Options struct {
+	// EnableTestTools registers the failure-injection tool.
+	EnableTestTools bool
+	// TaskImage implements the container tool contract for the Go-based tools
+	// (cmd/task). Empty means their container variants are not registered.
+	TaskImage string
+	// PythonImage implements python_execute. Empty means it is not registered.
+	PythonImage string
+}
+
 // Builtins returns the tools that ship with the runtime.
 //
 // The failure-injection tools are gated: a production deployment must not
@@ -16,13 +32,25 @@ import (
 // the interesting behaviour of this system is what it does when things go
 // wrong, and that has to be exercisable end to end over the real API — plan
 // section 31's failure tests are not unit tests.
-func Builtins(enableTestTools bool) Registry {
+//
+// The container tools are gated on having an image, for a plainer reason: a
+// registry entry with no image is a tool that passes plan validation and then
+// fails every attempt at build time. It is better for a tool to be absent —
+// where the 400 says unknown_tool and names what IS available — than present
+// and broken.
+func Builtins(opt Options) Registry {
 	r := Registry{
 		"echo":  Echo{},
 		"sleep": Sleep{},
 	}
-	if enableTestTools {
+	if opt.EnableTestTools {
 		r["fail"] = Fail{}
+	}
+	if opt.PythonImage != "" {
+		r["python_execute"] = PythonExecute(opt.PythonImage)
+	}
+	if opt.TaskImage != "" {
+		r["http_request"] = HTTPRequest(opt.TaskImage)
 	}
 	return r
 }

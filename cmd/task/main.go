@@ -3,8 +3,14 @@
 //
 // It exists so Week 3 has something real to run in a pod: the same echo, sleep
 // and fail behaviours the in-process tools provide, so the demo plans in the
-// README execute identically whether the executor is Local or Kubernetes. Week
-// 4 replaces it with the Python sandbox, against the same contract.
+// README execute identically whether the executor is Local or Kubernetes.
+//
+// Week 4 adds http_request, the one tool that asks for the network — and the
+// only way to observe whether the sandbox NetworkPolicy is enforced, since
+// every other task pod runs with egress denied and would not notice either
+// way. The Python sandbox is a SEPARATE image against this same contract
+// (deploy/docker/python/runner.py), which is what proves the contract is
+// "environment in, marker line out" rather than "whatever this binary does".
 //
 // # The contract
 //
@@ -113,6 +119,13 @@ func dispatch(tool string, params map[string]any, getenv func(string) string,
 		// activeDeadlineSeconds both bound it from outside.
 		time.Sleep(d)
 		return map[string]any{"slept_ms": d.Milliseconds()}, 0
+
+	case "http_request":
+		// The only tool that touches the network, and the reason the sandbox
+		// NetworkPolicy has an allow path at all. See http.go: it refuses to
+		// connect to anything that is not a public address, independently of
+		// whether the CNI is enforcing anything.
+		return httpRequest(params, stderr)
 
 	case "fail":
 		// Exists to exercise the failure paths over a real cluster: a step that

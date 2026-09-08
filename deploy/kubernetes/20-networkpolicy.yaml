@@ -1,0 +1,152 @@
+# The sandbox network policy.
+#
+#   kubectl apply -f deploy/kubernetes/20-networkpolicy.yaml
+#   ./deploy/kind/verify-networkpolicy.sh        <-- run this, every time
+#
+# READ THIS FIRST. A NetworkPolicy is enforced by the CNI plugin, not by
+# Kubernetes. kind's default CNI (kindnet) does NOT implement NetworkPolicy:
+# these objects apply cleanly, `kubectl get networkpolicy` lists them, `kubectl
+# describe` shows the rules, and every packet flows exactly as before. There is
+# no error, no event, and no warning anywhere.
+#
+# That is the worst failure mode a security control can have, because every
+# observable signal reports success. deploy/kind/cluster.yaml therefore disables
+# the default CNI and installs Calico, and verify-networkpolicy.sh proves
+# enforcement with real pods rather than believing this file.
+#
+# The model, in one sentence: a task pod may talk to nothing, unless RunMesh's
+# execution policy resolved network access for it, in which case it may reach
+# the public internet and still nothing inside the cluster.
+
+# ─── 1. deny everything, for every task pod ──────────────────────────────────
+# podSelector: {} means EVERY pod in the namespace, including ones created by a
+# future version of RunMesh that forgets to label them. Default-deny is the only
+# safe default: a pod matched by no policy at all is unrestricted, so the
+# baseline has to match everything.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: task-default-deny
+  namespace: runmesh-tasks
+  labels:
+    app.kubernetes.io/name: runmesh
+    app.kubernetes.io/component: task
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+  # No ingress and no egress rules at all. Not an empty list of allowances —
+  # the absence of any rule, which denies.
+  #
+  # Ingress stays denied for every task pod for ever, including the ones granted
+  # egress below: a task is a batch workload that dials out and exits. Nothing
+  # in the cluster should be able to reach INTO it, and nothing needs to.
+
+---
+# ─── 2. DNS, for the pods that are allowed out ───────────────────────────────
+# Split from the internet rule below because it is a different trust decision:
+# this permits traffic to a pod INSIDE the cluster (CoreDNS), which rule 3
+# deliberately forbids. Without it, "allow egress to the internet" resolves no
+# hostnames and every request fails with a name-resolution error that looks
+# nothing like a network policy.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: task-egress-dns
+  namespace: runmesh-tasks
+  labels:
+    app.kubernetes.io/name: runmesh
+    app.kubernetes.io/component: task
+spec:
+  podSelector:
+    matchLabels:
+      # Set by internal/k8s.BuildJob from the RESOLVED limits — that is, from
+      # what the execution policy granted, never from what the plan asked for.
+      runmesh.io/network: allow
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+---
+# ─── 3. the public internet, and nothing else ────────────────────────────────
+# ipBlock is evaluated against the DESTINATION IP after DNS resolution, which is
+# what makes the `except` list an actual control rather than a hostname filter:
+# a task that resolves an attacker-controlled name to 10.0.0.5 still cannot
+# reach it.
+#
+# Every excluded range is here for a specific reason, and the third one is the
+# reason this rule exists at all.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: task-egress-internet
+  namespace: runmesh-tasks
+  labels:
+    app.kubernetes.io/name: runmesh
+    app.kubernetes.io/component: task
+spec:
+  podSelector:
+    matchLabels:
+      runmesh.io/network: allow
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              # RFC 1918. The cluster's own pods, services and nodes live in
+              # here, as does everything else on the network the cluster is
+              # plugged into — the database, the internal admin panel, the
+              # other team's staging environment.
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+
+              # 169.254.169.254 is the cloud instance metadata service, and on
+              # EC2, GCE and Azure it hands out the node's IAM credentials to
+              # anything that asks over plain HTTP with no authentication. It
+              # is the single most valuable target reachable from a container,
+              # and "SSRF to metadata to cluster-admin" is a well-trodden path.
+              # The whole link-local range goes, not just that address.
+              - 169.254.0.0/16
+
+              # Loopback as seen from another host, and the "this network"
+              # range. Neither is a legitimate destination for a task.
+              - 127.0.0.0/8
+              - 0.0.0.0/8
+
+              # Carrier-grade NAT. Not routable on the public internet and used
+              # by some cloud providers for internal services.
+              - 100.64.0.0/10
+      # Ports are not restricted. The tool contract is HTTP, but pinning 80/443
+      # here would break a legitimate fetch from a host on 8443 while stopping
+      # nothing an attacker with egress could not do over 443 anyway. The
+      # destination is what matters, and that is what the except list controls.
+
+# ─── what is deliberately NOT here ───────────────────────────────────────────
+#
+# An egress rule to the RunMesh API. Task pods do not call back: results come
+# out of the container's stdout, read by RunMesh through the Kubernetes API
+# (ADR 0003). That design decision is what lets the sandbox have no route to the
+# control plane at all — and it is why moving to callback-style result
+# collection in a later phase is a security change, not just a transport one.
+#
+# A policy for the `runmesh` control-plane namespace. RunMesh itself needs the
+# API server and PostgreSQL, and locking down the control plane is a different
+# exercise with different failure modes; claiming it here without the tests to
+# back it would be exactly the sort of unverified assertion this file opens by
+# warning about.

@@ -21,17 +21,27 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
         -ldflags "-s -w" \
         -o /out/task ./cmd/task
 
-# scratch, not distroless: cmd/task imports only the standard library, so there
-# is genuinely nothing to put in the image but the binary. A task image is the
-# thing most worth keeping small — it is pulled once per node per attempt, and
-# it is the blast radius when a tool is compromised.
-FROM scratch
+# distroless/static rather than scratch, and the reason is one file.
+#
+# Week 3's version of this image WAS scratch: cmd/task imported only the
+# standard library and there was genuinely nothing to add. Week 4 added
+# http_request, and a static Go binary on scratch has no root certificates, so
+# every https:// fetch fails with "certificate signed by unknown authority" —
+# a message that sends you looking at the server, the proxy and the NetworkPolicy
+# before you think of the image.
+#
+# distroless/static:nonroot is the smallest base that carries
+# /etc/ssl/certs/ca-certificates.crt, and it still has no shell, no package
+# manager and no libc. The image stays the blast radius when a tool is
+# compromised, and it stays a few megabytes.
+FROM gcr.io/distroless/static-debian12:nonroot
 
 COPY --from=build /out/task /task
 
-# 65532 is distroless' "nonroot" uid, used here so the same value works whether
-# a pod's securityContext names it or the image supplies it. Week 4 makes
-# runAsNonRoot mandatory in the pod spec; this image already satisfies it.
+# 65532 is distroless' "nonroot" uid, restated here so the same value works
+# whether a pod's securityContext names it or the image supplies it. The pod
+# spec sets runAsNonRoot, a read-only root filesystem and drops every
+# capability (internal/k8s/job.go); this image already satisfies all of it.
 USER 65532:65532
 
 ENTRYPOINT ["/task"]

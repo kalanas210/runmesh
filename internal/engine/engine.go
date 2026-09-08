@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/kalanas210/runmesh/internal/clock"
+	"github.com/kalanas210/runmesh/internal/policy"
 	"github.com/kalanas210/runmesh/internal/runmesh"
 	"github.com/kalanas210/runmesh/internal/tools"
 )
@@ -102,6 +103,23 @@ func (c *Config) setDefaults() {
 	}
 }
 
+// Sandbox resolves the security envelope for an attempt: the CPU, memory,
+// scratch space, image and network access the operator's execution policy
+// grants this tool, as opposed to what the tool asked for.
+//
+// It is consulted per ATTEMPT rather than once at submission on purpose. A step
+// can sit queued behind a retry backoff for minutes and behind a dead worker's
+// lease for longer; resolving at dispatch means a policy tightened in between —
+// a tool denied, the network switched off — binds the very next attempt instead
+// of only new submissions.
+//
+// A refusal is a classified terminal error, and the worker settles it like any
+// other terminal outcome: the step fails, the timeline records why, and nothing
+// retries a decision that will not change.
+type Sandbox interface {
+	Limits(tool string, req policy.Request) (tools.Limits, error)
+}
+
 // Deps are the collaborators an engine needs. They are all interfaces or
 // values, so a test constructs an engine with a fake clock and an in-memory
 // store and nothing else.
@@ -110,6 +128,11 @@ type Deps struct {
 	Executor tools.Executor
 	Clock    clock.Clock
 	Log      *slog.Logger
+	// Sandbox is optional in a test and mandatory in the server. Nil means
+	// policy.Passthrough: the tool gets exactly what it asked for, which is
+	// what every Week-1 and Week-2 test assumes and is why they did not have to
+	// change when the policy engine arrived.
+	Sandbox Sandbox
 }
 
 // Engine owns the runtime goroutines.
@@ -117,6 +140,7 @@ type Engine struct {
 	cfg   Config
 	store Store
 	exec  tools.Executor
+	box   Sandbox
 	clock clock.Clock
 	log   *slog.Logger
 
@@ -161,12 +185,16 @@ func New(cfg Config, d Deps) (*Engine, error) {
 	if d.Log == nil {
 		d.Log = slog.Default()
 	}
+	if d.Sandbox == nil {
+		d.Sandbox = policy.Passthrough{}
+	}
 	cfg.setDefaults()
 
 	return &Engine{
 		cfg:          cfg,
 		store:        d.Store,
 		exec:         d.Executor,
+		box:          d.Sandbox,
 		clock:        d.Clock,
 		log:          d.Log.With("component", "engine"),
 		leases:       make(chan runmesh.Lease),

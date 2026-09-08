@@ -36,16 +36,35 @@ func (a *API) createJob(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, a.log, err)
 		return
 	}
-	// Per-tool validation runs at submit time too, so a malformed parameter is
-	// a 400 now rather than a step that fails three times in an hour.
-	for i, s := range plan.Steps {
-		if err := a.tools.Validate(s.Tool, s.Params); err != nil {
-			writeError(w, r, a.log, &runmesh.ValidationError{Details: []runmesh.Detail{{
+	// Per-tool validation and the execution policy both run at submit time, so
+	// a malformed parameter or a tool this deployment refuses is a 400 now
+	// rather than a step that fails three times in an hour.
+	//
+	// Both are reported through the same per-field envelope, and every problem
+	// is collected rather than the first one returned. That matters far more
+	// when the author is a language model retrying in a loop than when it is a
+	// human: one response says everything that is wrong with the plan, so the
+	// repair pass in Week 5 has something complete to work from.
+	var details []runmesh.Detail
+	for i, step := range plan.Steps {
+		if err := a.tools.Validate(step.Tool, step.Params); err != nil {
+			details = append(details, runmesh.Detail{
 				Field: fmt.Sprintf("steps[%d].params", i),
 				Issue: err.Error(),
-			}}})
-			return
+			})
 		}
+		if a.policy != nil {
+			if err := a.policy.Allows(step.Tool); err != nil {
+				details = append(details, runmesh.Detail{
+					Field: fmt.Sprintf("steps[%d].tool", i),
+					Issue: policyIssue(err),
+				})
+			}
+		}
+	}
+	if len(details) > 0 {
+		writeError(w, r, a.log, &runmesh.ValidationError{Details: details})
+		return
 	}
 
 	now := a.clock.Now()
@@ -192,6 +211,20 @@ func (a *API) jobEvents(w http.ResponseWriter, r *http.Request) {
 		Truncated: page.Truncated,
 		OldestSeq: page.OldestSeq,
 	})
+}
+
+// policyIssue renders a policy refusal for the 400 body.
+//
+// The classified code is kept and put FIRST, because it is the stable,
+// low-cardinality half — a client can branch on tool_denied without parsing
+// English, and the sentence after it is what a human needs to know which
+// variable to change.
+func policyIssue(err error) string {
+	var te *runmesh.ToolError
+	if errors.As(err, &te) {
+		return te.Code + ": " + te.Message
+	}
+	return err.Error()
 }
 
 // decodeJSON reads exactly one JSON value into v.

@@ -66,7 +66,7 @@ func TestRegistryLookupAndAllowlist(t *testing.T) {
 // it is built once during wiring and only ever read afterwards.
 func TestRegistryConcurrentReads(t *testing.T) {
 	t.Parallel()
-	reg := tools.Builtins(true)
+	reg := tools.Builtins(tools.Options{EnableTestTools: true})
 
 	var wg sync.WaitGroup
 	for range 32 {
@@ -402,14 +402,14 @@ func TestFailInjectsTheRequestedFailure(t *testing.T) {
 // must not exist unless somebody explicitly asked for it.
 func TestTestToolsAreGated(t *testing.T) {
 	t.Parallel()
-	if tools.Builtins(false).Has("fail") {
+	if tools.Builtins(tools.Options{}).Has("fail") {
 		t.Error("the fail tool is registered by default")
 	}
-	if !tools.Builtins(true).Has("fail") {
+	if !tools.Builtins(tools.Options{EnableTestTools: true}).Has("fail") {
 		t.Error("the fail tool is missing even when test tools are enabled")
 	}
 	for _, name := range []string{"echo", "sleep"} {
-		if !tools.Builtins(false).Has(name) {
+		if !tools.Builtins(tools.Options{}).Has(name) {
 			t.Errorf("the %s tool is not registered by default", name)
 		}
 	}
@@ -419,7 +419,7 @@ func TestTestToolsAreGated(t *testing.T) {
 // these values, so they have to exist before the executor that reads them.
 func TestBuiltinsDeclareLimits(t *testing.T) {
 	t.Parallel()
-	for _, d := range tools.Builtins(true).Descriptors() {
+	for _, d := range tools.Builtins(tools.Options{EnableTestTools: true}).Descriptors() {
 		if d.Version == "" {
 			t.Errorf("tool %s has no version", d.Name)
 		}

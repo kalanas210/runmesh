@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/kalanas210/runmesh/internal/clock"
+	"github.com/kalanas210/runmesh/internal/policy"
 	"github.com/kalanas210/runmesh/internal/runmesh"
 	"github.com/kalanas210/runmesh/internal/tools"
 )
@@ -196,6 +197,26 @@ func (e *Engine) invoke(ctx context.Context, log *slog.Logger, l runmesh.Lease, 
 		}
 	}()
 
+	// The security envelope is resolved HERE, per attempt, and never taken
+	// from the plan. A step carries the timeout and attempt budget it was
+	// submitted with; everything that decides how much of the machine it may
+	// touch — CPU, memory, scratch, image, network — comes from the operator's
+	// policy, applied now. From Week 5 the author of the plan is a language
+	// model, so "the plan cannot widen its own sandbox" is not a nicety.
+	limits, err := e.box.Limits(l.Tool, policy.Request{
+		Timeout:        l.Timeout,
+		MaxAttempts:    l.MaxAttempts,
+		MaxOutputBytes: e.cfg.MaxOutputBytes,
+	})
+	if err != nil {
+		// A refusal is already a classified terminal error. It travels the
+		// ordinary outcome path so the step fails once, with a reason on the
+		// timeline, rather than being retried against a decision that will
+		// give the same answer three times.
+		done <- toolResult{err: err}
+		return
+	}
+
 	out, err := e.exec.Execute(ctx, tools.Input{
 		JobID:          l.JobID,
 		StepID:         l.StepID,
@@ -205,13 +226,9 @@ func (e *Engine) invoke(ctx context.Context, log *slog.Logger, l runmesh.Lease, 
 		Tool:           l.Tool,
 		Params:         l.Params,
 		Deps:           l.Deps,
-		Limits: tools.Limits{
-			Timeout:        l.Timeout,
-			MaxAttempts:    l.MaxAttempts,
-			MaxOutputBytes: e.cfg.MaxOutputBytes,
-		},
-		Log:   log,
-		Clock: e.clock,
+		Limits:         limits,
+		Log:            log,
+		Clock:          e.clock,
 	})
 	done <- toolResult{out: out, err: err}
 }

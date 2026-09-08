@@ -5,11 +5,16 @@ kind create cluster --config deploy/kind/cluster.yaml
 kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.28.2/manifests/calico.yaml
 kubectl wait --for=condition=Ready node --all --timeout=300s
 
-kubectl apply -f deploy/kubernetes/00-namespaces.yaml -f deploy/kubernetes/10-rbac.yaml
+kubectl apply -f deploy/kubernetes/
 
-docker build -f deploy/docker/task.Dockerfile -t runmesh/task:dev .
-kind load docker-image runmesh/task:dev --name runmesh
+docker build -f deploy/docker/task.Dockerfile   -t runmesh/task:dev   .
+docker build -f deploy/docker/python.Dockerfile -t runmesh/python:dev .
+kind load docker-image runmesh/task:dev runmesh/python:dev --name runmesh
+
+./deploy/kind/verify-networkpolicy.sh
 ```
+
+That last line is not optional. See below.
 
 The Calico manifest is referenced by pinned tag rather than vendored: it is a
 quarter of a megabyte of generated YAML that nothing in this repository edits,
@@ -24,21 +29,41 @@ time out there, which is a confusing way to learn it.
 
 The reason for disabling it is in the cluster config: kind's default CNI
 (kindnet) **does not enforce NetworkPolicy**. Policies apply without error,
-`kubectl get networkpolicy` lists them, and they do nothing. Week 4 puts the
-tool sandbox behind one, and a security control whose every observable signal
-says "in place" while it permits everything is the worst thing to discover late.
+`kubectl get networkpolicy` lists them, and they do nothing. The tool sandbox is
+behind one, and a security control whose every observable signal says "in place"
+while it permits everything is the worst thing to discover late.
 
-Verify enforcement rather than believing it:
+## Verify the sandbox, do not believe it
 
 ```bash
-kubectl -n runmesh-tasks run probe --image=busybox:1.36 --restart=Never -- \
-    sh -c 'wget -qO- --timeout=3 https://example.com >/dev/null && echo REACHABLE || echo BLOCKED'
-kubectl -n runmesh-tasks logs probe
+./deploy/kind/verify-networkpolicy.sh
 ```
 
-With no policy it prints `REACHABLE`. Once Week 4's deny-all policy is applied,
-the same command must print `BLOCKED`. If it still says `REACHABLE`, the CNI is
-not enforcing and nothing built on top of that policy is real.
+Four probes, about a minute:
+
+| Probe | Expected | What a wrong answer means |
+|---|---|---|
+| a `network=deny` pod fetches a URL | blocked | the default-deny policy is not enforced |
+| a `network=deny` pod fetches an IP | blocked | as above, and not merely DNS failing |
+| a `network=allow` pod fetches a URL | reached | the grant path is broken; `http_request` cannot work |
+| a `network=allow` pod fetches the cluster API | blocked | egress is `0.0.0.0/0` with no exclusions — the instance metadata service is reachable |
+
+The fourth is the one worth having. A policy that permits egress to everything
+passes the first three and is wide open to `169.254.169.254`, which on EC2, GCE
+and Azure hands out the node's cloud credentials to anything that asks.
+
+Run it after creating the cluster, after upgrading the CNI, and before believing
+any sentence in this repository containing the word "isolated".
+
+Two things back it up from the Go side, and neither replaces it:
+
+- `TestNetworkPolicySelectorsMatchTheJobLabels` reads the shipped manifests and
+  fails if the `runmesh.io/network` label the code sets stops matching the
+  selector the YAML uses — a drift that would leave task pods matching *no*
+  policy, which Kubernetes treats as unrestricted.
+- `cmd/task` refuses to connect to any non-public address itself, checked in the
+  dialer after DNS resolution. That is the control that holds when the CNI turns
+  out not to enforce anything.
 
 ## Requirements, and the one that bites on Windows
 

@@ -53,6 +53,25 @@ type Deps struct {
 	// wrong answer would mislead the dashboard and, in Week 5, the planner
 	// that is handed these descriptors as function declarations.
 	ExecutionMode tools.ExecutionMode
+
+	// Sandbox is the execution policy. The API consults it at SUBMIT time, so
+	// a plan naming a tool this deployment refuses is a 400 that says which
+	// switch to flip — rather than a job that is accepted, queued, dispatched
+	// and then failed by a worker with the same message an hour later.
+	//
+	// It is the same object the engine holds, which is what makes the two
+	// answers identical by construction rather than by review.
+	Sandbox Policy
+}
+
+// Policy is the slice of the execution policy the API needs. Declared here as
+// an interface, like Runtime above, so httpapi does not import the policy
+// package and a test can refuse a tool in three lines.
+type Policy interface {
+	// Allows reports whether this deployment will run the named tool at all.
+	Allows(tool string) error
+	// Descriptors is the catalogue as it will actually behave here.
+	Descriptors() []tools.Descriptor
 }
 
 // API holds the handler dependencies. It is unexported state behind a
@@ -66,6 +85,7 @@ type API struct {
 
 	limits        runmesh.Limits
 	defaults      runmesh.Defaults
+	policy        Policy
 	executionMode tools.ExecutionMode
 	maxQueueDepth int
 	durable       bool
@@ -109,6 +129,7 @@ func New(d Deps) (http.Handler, *API, error) {
 		log:           d.Log.With("component", "httpapi"),
 		limits:        d.Limits,
 		defaults:      d.Defaults,
+		policy:        d.Sandbox,
 		executionMode: d.ExecutionMode,
 		maxQueueDepth: d.MaxQueueDepth,
 		durable:       d.Durable,
@@ -234,10 +255,21 @@ func (a *API) isDraining() bool {
 // listTools is GET /api/v1/tools: the registry, with each tool's contract.
 // In Week 5 this same descriptor list is what Gemini is given as its function
 // declarations, which is why input_schema is served verbatim.
+//
+// The limits served are the EFFECTIVE ones — what the operator's execution
+// policy will actually grant — not what the tool's descriptor asked for.
+// Publishing the request rather than the grant would tell a planner it has 2
+// CPUs on a cluster that will give it 250m, and every plan built on that
+// number would be wrong in the same direction.
 func (a *API) listTools(w http.ResponseWriter, r *http.Request) {
-	descriptors := a.tools.Descriptors()
-	for i := range descriptors {
-		descriptors[i].Execution = a.executionMode
+	var descriptors []tools.Descriptor
+	if a.policy != nil {
+		descriptors = a.policy.Descriptors()
+	} else {
+		descriptors = a.tools.Descriptors()
+		for i := range descriptors {
+			descriptors[i].Execution = a.executionMode
+		}
 	}
 	writeJSON(w, a.log, http.StatusOK, toolsResponse{Tools: descriptors})
 }

@@ -95,9 +95,38 @@ type Config struct {
 	K8sPollInterval       time.Duration
 	K8sCleanupTimeout     time.Duration
 
+	// The pod security context every task runs under. These are configurable
+	// and not constants because a hardened base image in somebody else's
+	// registry may not use 65532 - but there is no way to switch the hardening
+	// OFF, which is the point: runAsNonRoot, a read-only root filesystem, no
+	// capabilities and no privilege escalation are properties of the spec
+	// builder, not options.
+	K8sRunAsUser        int64
+	K8sRunAsGroup       int64
+	K8sTerminationGrace time.Duration
+
+	// Execution policy: the operator's ceiling on what any tool may have.
+	// A descriptor asks; this grants. See internal/policy.
+	PolicyDefaultCPU              string
+	PolicyDefaultMemory           string
+	PolicyDefaultEphemeralStorage string
+	PolicyMaxCPU                  string
+	PolicyMaxMemory               string
+	PolicyMaxEphemeralStorage     string
+	PolicyAllowNetwork            bool
+	PolicyAllowTools              []string
+	PolicyDenyTools               []string
+	PolicyImagePrefixes           []string
+
 	// Tools
 	EnableTestTools bool
 	MaxOutputBytes  int
+	// TaskImage implements the container tool contract for the Go tools; it
+	// defaults to K8sImage. PythonImage backs python_execute, and an empty one
+	// means the tool is not registered at all - better an honest unknown_tool
+	// than a tool that passes validation and fails every attempt.
+	TaskImage   string
+	PythonImage string
 
 	// Observability
 	LogLevel  slog.Level
@@ -180,8 +209,36 @@ func Load(getenv func(string) string) (Config, error) {
 		K8sPollInterval:       l.dur("RUNMESH_K8S_POLL_INTERVAL", 500*time.Millisecond),
 		K8sCleanupTimeout:     l.dur("RUNMESH_K8S_CLEANUP_TIMEOUT", 15*time.Second),
 
+		// 65532 is distroless' "nonroot" uid, which both shipped images
+		// already use. The grace period is short because a task pod is deleted
+		// exactly when RunMesh has decided it should stop: waiting 30 seconds
+		// for a workload that is being cancelled is 30 seconds of a node held
+		// by work nobody wants the answer to.
+		K8sRunAsUser:        int64(l.num("RUNMESH_K8S_RUN_AS_USER", 65532)),
+		K8sRunAsGroup:       int64(l.num("RUNMESH_K8S_RUN_AS_GROUP", 65532)),
+		K8sTerminationGrace: l.dur("RUNMESH_K8S_TERMINATION_GRACE", 5*time.Second),
+
+		// The shipped ceiling is small on purpose. A default that fits the
+		// development kind cluster means the first surprise is "my step was
+		// clamped", which is a log line, rather than "one plan filled the
+		// node", which is an outage.
+		PolicyDefaultCPU:              l.str("RUNMESH_POLICY_DEFAULT_CPU", "250m"),
+		PolicyDefaultMemory:           l.str("RUNMESH_POLICY_DEFAULT_MEMORY", "128Mi"),
+		PolicyDefaultEphemeralStorage: l.str("RUNMESH_POLICY_DEFAULT_EPHEMERAL_STORAGE", "64Mi"),
+		PolicyMaxCPU:                  l.str("RUNMESH_POLICY_MAX_CPU", "1"),
+		PolicyMaxMemory:               l.str("RUNMESH_POLICY_MAX_MEMORY", "512Mi"),
+		PolicyMaxEphemeralStorage:     l.str("RUNMESH_POLICY_MAX_EPHEMERAL_STORAGE", "512Mi"),
+		// Off. A runtime that executes model-authored plans should not reach
+		// the internet because nobody said otherwise.
+		PolicyAllowNetwork:  l.boolean("RUNMESH_POLICY_ALLOW_NETWORK", false),
+		PolicyAllowTools:    l.csv("RUNMESH_POLICY_TOOLS_ALLOW"),
+		PolicyDenyTools:     l.csv("RUNMESH_POLICY_TOOLS_DENY"),
+		PolicyImagePrefixes: l.csv("RUNMESH_POLICY_IMAGE_PREFIXES"),
+
 		EnableTestTools: l.boolean("RUNMESH_ENABLE_TEST_TOOLS", false),
 		MaxOutputBytes:  l.num("RUNMESH_MAX_OUTPUT_BYTES", 64<<10),
+		TaskImage:       l.str("RUNMESH_TASK_IMAGE", ""),
+		PythonImage:     l.str("RUNMESH_PYTHON_IMAGE", ""),
 
 		LogLevel:  l.level("RUNMESH_LOG_LEVEL", slog.LevelInfo),
 		LogFormat: l.str("RUNMESH_LOG_FORMAT", "json"),
@@ -199,6 +256,12 @@ func Load(getenv func(string) string) (Config, error) {
 	}
 	if c.DBMaxIdleConns == 0 {
 		c.DBMaxIdleConns = c.DBMaxOpenConns
+	}
+	// The Go tools' image is the default task image unless it is overridden,
+	// so a single-image deployment configures one variable and a two-image one
+	// configures two.
+	if c.TaskImage == "" {
+		c.TaskImage = c.K8sImage
 	}
 
 	if err := errors.Join(append(l.errs, c.Validate()...)...); err != nil {
@@ -344,6 +407,40 @@ func (c Config) Validate() []error {
 	if c.MaxOutputBytes < 1 {
 		bad("RUNMESH_MAX_OUTPUT_BYTES must be >= 1, got %d", c.MaxOutputBytes)
 	}
+	// runAsNonRoot with runAsUser: 0 is a spec the kubelet refuses at
+	// admission, and it refuses it for every pod, so catching it here turns a
+	// fleet-wide outage into a boot error naming the variable.
+	if c.K8sRunAsUser < 1 {
+		bad("RUNMESH_K8S_RUN_AS_USER must be >= 1, got %d: task pods run with "+
+			"runAsNonRoot, and uid 0 is refused at admission", c.K8sRunAsUser)
+	}
+	if c.K8sRunAsGroup < 1 {
+		bad("RUNMESH_K8S_RUN_AS_GROUP must be >= 1, got %d", c.K8sRunAsGroup)
+	}
+	if c.K8sTerminationGrace < 0 {
+		bad("RUNMESH_K8S_TERMINATION_GRACE must not be negative, got %s", c.K8sTerminationGrace)
+	}
+	// A tool named on both lists is not a policy, it is a question. Deny wins
+	// at runtime, but the operator who wrote both meant one of them.
+	for _, name := range c.PolicyAllowTools {
+		for _, denied := range c.PolicyDenyTools {
+			if name == denied {
+				bad("tool %q is on both RUNMESH_POLICY_TOOLS_ALLOW and "+
+					"RUNMESH_POLICY_TOOLS_DENY; deny would win, so say so once", name)
+			}
+		}
+	}
+	// python_execute is registered only when it has an image, so allowlisting
+	// it without one produces a plan that 400s with unknown_tool and an
+	// operator who is certain they enabled it.
+	if c.PythonImage == "" {
+		for _, name := range c.PolicyAllowTools {
+			if name == "python_execute" {
+				bad("RUNMESH_POLICY_TOOLS_ALLOW names python_execute but " +
+					"RUNMESH_PYTHON_IMAGE is empty, so the tool is not registered")
+			}
+		}
+	}
 	if c.MaxRequestBytes < 1 {
 		bad("RUNMESH_MAX_REQUEST_BYTES must be >= 1, got %d", c.MaxRequestBytes)
 	}
@@ -473,6 +570,23 @@ func (l *loader) dur(key string, def time.Duration) time.Duration {
 		return def
 	}
 	return d
+}
+
+// csv reads a comma-separated list. Empty entries are dropped rather than
+// producing an empty-string element, because an allowlist containing "" is an
+// allowlist that quietly matches a tool whose name nobody set.
+func (l *loader) csv(key string) []string {
+	v, ok := l.raw(key)
+	if !ok {
+		return nil
+	}
+	var out []string
+	for _, part := range strings.Split(v, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }
 
 func (l *loader) boolean(key string, def bool) bool {
