@@ -1,0 +1,91 @@
+# Least privilege, written out verb by verb.
+#
+# The test of an RBAC policy is not what it allows but what it refuses, so the
+# integration test asserts BOTH: that RunMesh can create a Job in runmesh-tasks,
+# and that it cannot create one in its own namespace, cannot read Secrets, and
+# cannot touch nodes. A Role nobody probes is a Role nobody knows the shape of.
+
+# ─── the identity RunMesh runs as ────────────────────────────────────────────
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: runmesh
+  namespace: runmesh
+  labels:
+    app.kubernetes.io/name: runmesh
+    app.kubernetes.io/component: control-plane
+
+---
+# ─── the identity TASK PODS run as ───────────────────────────────────────────
+# Separate from RunMesh's, and bound to nothing at all: it holds no Role and no
+# RoleBinding anywhere, so it can do nothing. The Job spec also sets
+# automountServiceAccountToken: false, so a task pod does not even receive a
+# token to try it with. Two independent mechanisms, because this is the account
+# an untrusted, LLM-selected workload runs as.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: runmesh-task
+  namespace: runmesh-tasks
+  labels:
+    app.kubernetes.io/name: runmesh
+    app.kubernetes.io/component: task
+automountServiceAccountToken: false
+
+---
+# ─── what RunMesh may do, and only in runmesh-tasks ──────────────────────────
+# A Role, not a ClusterRole. A ClusterRole with these same verbs would let
+# RunMesh delete Jobs in every namespace in the cluster, which is a very
+# different program from the one described in the README.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: runmesh-task-runner
+  namespace: runmesh-tasks
+rules:
+  # Create the workload, watch it, and clean it up. `deletecollection` is
+  # absent on purpose: the executor deletes Jobs it named itself, one at a
+  # time, and a bulk delete is the verb you regret granting.
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+
+  # Read-only on pods, to find the one a Job created and to read its result.
+  # No create: RunMesh makes Jobs and lets the Job controller make pods, which
+  # is exactly the completion-semantics-for-free argument in ADR 0003.
+  # No delete: deleting the Job removes its pods through ownership.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+
+  # The result channel. This subresource is the whole reason stdout works as a
+  # transport, and it is also the reason a task's logs must be assumed
+  # readable by RunMesh — a tool should not print secrets.
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+
+  # Deliberately NOT granted, each for a reason worth stating:
+  #   secrets            — RunMesh has no business reading them, and this is
+  #                        the single most valuable escalation in a namespace
+  #   pods/exec          — would turn log-reading into arbitrary code execution
+  #                        inside a running task
+  #   configmaps (write) — nothing here creates one; Week 4 revisits if the
+  #                        params channel outgrows the environment
+  #   events (write)     — RunMesh has its own timeline; writing Kubernetes
+  #                        events too would be a second, worse one
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: runmesh-task-runner
+  namespace: runmesh-tasks
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: runmesh-task-runner
+subjects:
+  - kind: ServiceAccount
+    name: runmesh
+    namespace: runmesh

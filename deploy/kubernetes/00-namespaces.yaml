@@ -1,0 +1,29 @@
+# Two namespaces, and the split is the whole security model.
+#
+# RunMesh's own control plane runs in one; the workloads it creates on behalf
+# of an LLM-authored plan run in the other. That boundary is what makes the
+# Role in 10-rbac.yaml meaningful: it grants RunMesh authority over `runmesh-tasks`
+# and nowhere else, so a compromised RunMesh cannot touch its own Deployment,
+# its own Secret, or anything belonging to another team in the cluster.
+#
+# One namespace for both would have been simpler and would have quietly granted
+# every task pod's neighbour the right to delete the control plane.
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: runmesh
+  labels:
+    app.kubernetes.io/name: runmesh
+    app.kubernetes.io/component: control-plane
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: runmesh-tasks
+  labels:
+    app.kubernetes.io/name: runmesh
+    app.kubernetes.io/component: tasks
+    # Week 4 hangs the sandbox NetworkPolicy off this namespace, and Calico is
+    # already installed so that the policy will actually be enforced rather
+    # than accepted and ignored. See deploy/kind/cluster.yaml.

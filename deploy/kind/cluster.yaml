@@ -1,0 +1,36 @@
+# The local Kubernetes cluster RunMesh develops and tests against.
+#
+#   kind create cluster --name runmesh --config deploy/kind/cluster.yaml
+#   kubectl apply -f deploy/kind/calico.yaml     (see deploy/kind/README.md)
+#
+# One decision here matters more than everything else in the file.
+
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: runmesh
+
+networking:
+  # kind's default CNI is kindnet, and kindnet DOES NOT ENFORCE NetworkPolicy.
+  # Policies apply without error, `kubectl get networkpolicy` lists them, and
+  # they silently do nothing at all.
+  #
+  # That is the worst possible failure mode for a security control: every
+  # observable signal says the restriction is in place. Week 4 puts the tool
+  # sandbox behind a NetworkPolicy, so discovering this then — with the
+  # "restriction" quietly permitting everything — is the outcome this line
+  # exists to prevent. Disable the default CNI and install Calico, which does
+  # enforce it, and verify enforcement with a pod rather than believing the
+  # manifest.
+  disableDefaultCNI: true
+
+  # Calico's own default pod CIDR. kind's is 10.244.0.0/16; leaving them
+  # mismatched is the usual reason a freshly-installed Calico never gets past
+  # the first pod.
+  podSubnet: "192.168.0.0/16"
+
+nodes:
+  # A single node, which on kind is schedulable: the control-plane taint is
+  # removed for you. Multi-node makes scheduling more realistic and costs a
+  # second container's worth of memory; add `- role: worker` when there is
+  # something to learn from it.
+  - role: control-plane
