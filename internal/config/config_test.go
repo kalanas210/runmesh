@@ -38,6 +38,13 @@ func TestLoadDefaults(t *testing.T) {
 	}{
 		{"HTTPAddr", cfg.HTTPAddr, ":8080"},
 		{"Workers", cfg.Workers, 8},
+		// MaxWorkers tracks Workers when RUNMESH_MAX_WORKERS is never set,
+		// which is what makes adaptive sizing a no-op by default.
+		{"MaxWorkers", cfg.MaxWorkers, 8},
+		{"ConcurrencyInterval", cfg.ConcurrencyInterval, 15 * time.Second},
+		{"ConcurrencyErrorRate", cfg.ConcurrencyErrorRate, 0.2},
+		{"ConcurrencyHeadroom", cfg.ConcurrencyHeadroom, 0.5},
+		{"ConcurrencyStep", cfg.ConcurrencyStep, 1},
 		{"LeaseTTL", cfg.LeaseTTL, 30 * time.Second},
 		{"HeartbeatInterval", cfg.HeartbeatInterval, 5 * time.Second},
 		{"BackoffBase", cfg.BackoffBase, time.Second},
@@ -164,6 +171,32 @@ func TestCrossFieldInvariants(t *testing.T) {
 			name:    "claim batch larger than the pool",
 			env:     map[string]string{"RUNMESH_WORKERS": "4", "RUNMESH_CLAIM_BATCH": "8"},
 			wantHit: "RUNMESH_CLAIM_BATCH",
+		},
+		{
+			// Below Workers the pool would start above its own ceiling.
+			name:    "max workers below workers",
+			env:     map[string]string{"RUNMESH_WORKERS": "8", "RUNMESH_MAX_WORKERS": "4"},
+			wantHit: "RUNMESH_MAX_WORKERS",
+		},
+		{
+			name:    "concurrency interval not positive",
+			env:     map[string]string{"RUNMESH_CONCURRENCY_INTERVAL": "0s"},
+			wantHit: "RUNMESH_CONCURRENCY_INTERVAL",
+		},
+		{
+			name:    "concurrency error rate out of range",
+			env:     map[string]string{"RUNMESH_CONCURRENCY_ERROR_RATE": "1.5"},
+			wantHit: "RUNMESH_CONCURRENCY_ERROR_RATE",
+		},
+		{
+			name:    "concurrency headroom negative",
+			env:     map[string]string{"RUNMESH_CONCURRENCY_HEADROOM": "-0.1"},
+			wantHit: "RUNMESH_CONCURRENCY_HEADROOM",
+		},
+		{
+			name:    "concurrency step below one",
+			env:     map[string]string{"RUNMESH_CONCURRENCY_STEP": "0"},
+			wantHit: "RUNMESH_CONCURRENCY_STEP",
 		},
 		{
 			// Fewer than three heartbeats per lease means one slow store call
@@ -334,6 +367,38 @@ func TestWhitespaceIsTolerated(t *testing.T) {
 	}
 	if _, ok := cfg.APIKeyID(config.KeyDigest(goodKey)); !ok {
 		t.Error("a padded API key was not recognised")
+	}
+}
+
+// TestMaxWorkersWidensClaimBatchAndTheConnectionPool: RUNMESH_CLAIM_BATCH and
+// RUNMESH_DB_MAX_OPEN_CONNS are bounded by MaxWorkers rather than Workers, so
+// raising the adaptive ceiling raises what both of them may legally be — a
+// claim batch or a connection pool still capped at Workers would be a ceiling
+// on the feature RUNMESH_MAX_WORKERS exists to turn on.
+func TestMaxWorkersWidensClaimBatchAndTheConnectionPool(t *testing.T) {
+	t.Parallel()
+
+	// A claim batch above Workers is refused without a wider ceiling...
+	if _, err := config.Load(env(map[string]string{
+		"RUNMESH_WORKERS": "4", "RUNMESH_CLAIM_BATCH": "8",
+	})); err == nil {
+		t.Fatal("RUNMESH_CLAIM_BATCH above RUNMESH_WORKERS was accepted with no RUNMESH_MAX_WORKERS set")
+	}
+	// ...and accepted once RUNMESH_MAX_WORKERS reaches it.
+	cfg, err := config.Load(env(map[string]string{
+		"RUNMESH_WORKERS": "4", "RUNMESH_MAX_WORKERS": "8", "RUNMESH_CLAIM_BATCH": "8",
+		"RUNMESH_DATABASE_URL": "postgres://runmesh:runmesh@127.0.0.1:5432/runmesh?sslmode=disable",
+	}))
+	if err != nil {
+		t.Fatalf("a claim batch within RUNMESH_MAX_WORKERS was rejected: %v", err)
+	}
+	if cfg.ClaimBatch != 8 {
+		t.Errorf("ClaimBatch = %d, want 8", cfg.ClaimBatch)
+	}
+	// The connection pool's floor follows the same ceiling: Workers=4 would
+	// put it at 8, MaxWorkers=8 puts it at 12.
+	if want := 8 + 4; cfg.DBMaxOpenConns != want { // dbConnHeadroom is 4
+		t.Errorf("DBMaxOpenConns = %d, want %d (RUNMESH_MAX_WORKERS + headroom)", cfg.DBMaxOpenConns, want)
 	}
 }
 

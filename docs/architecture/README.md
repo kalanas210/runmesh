@@ -238,14 +238,18 @@ is exactly that drift. `TestClaimErrorsMetricMatchesStats` and
 agree after a real harness run.
 
 **An aggregation loop would be a goroutine.** `internal/engine`'s package doc
-fixes the goroutine census at exactly 2 + Workers, plus one transient goroutine
-per in-flight step. A metrics goroutine anywhere in this process contradicts a
-stated design invariant, and no test counts goroutines, so nothing would
-mechanically catch it. A `GaugeFunc` takes no context and owns no goroutine: it
-is read on the scrape's own goroutine and nowhere else. The same census is why
-`internal/eventbus` is its own package rather than a pump inside the engine, and
-why `go_goroutines` is worth exporting at all — that gauge is a live assertion
-of the invariant.
+fixes the goroutine census at exactly 2 + MaxWorkers, plus a third
+adaptive-concurrency controller when `RUNMESH_MAX_WORKERS` actually widens the
+pool above `RUNMESH_WORKERS`, plus one transient goroutine per in-flight step.
+A deployment that never sets `RUNMESH_MAX_WORKERS` has MaxWorkers == Workers
+and that third goroutine never starts at all — the census is textually the
+same 2 + Workers it always was. A metrics goroutine anywhere in this process
+contradicts that stated invariant, and no test counts goroutines, so nothing
+would mechanically catch it. A `GaugeFunc` takes no context and owns no
+goroutine: it is read on the scrape's own goroutine and nowhere else. The same
+census is why `internal/eventbus` is its own package rather than a pump inside
+the engine, and why `go_goroutines` is worth exporting at all — that gauge is
+a live assertion of the invariant.
 
 Cardinality is closed rather than trusted. `metrics.Label` is a name *plus its
 permitted values*, and the vocabularies are taken at wiring time from the objects

@@ -1,13 +1,26 @@
 // Package engine is the runtime: the dispatcher that claims work, the bounded
 // worker pool that executes it, the reconciler that recovers what a dead
-// worker left behind, and the pure policy — Classify and Backoff — that
-// decides what every outcome means.
+// worker left behind, the adaptive controller that resizes the pool between
+// Workers and MaxWorkers, and the pure policy — Classify, Backoff and
+// Concurrency — that decides what every outcome means.
 //
-// The goroutine census is fixed at boot and is exactly 2 + Workers, plus one
-// transient goroutine per in-flight step: one dispatcher, one reconciler, N
-// workers, and a tool runner for each step actually executing. There is no
-// goroutine per job, no goroutine per HTTP request beyond net/http's own, and
-// no supervisor tree.
+// The goroutine census is fixed at boot and is exactly 2 + MaxWorkers, plus
+// one transient goroutine per in-flight step: one dispatcher, one reconciler,
+// MaxWorkers workers, and a tool runner for each step actually executing.
+// Only Workers of the pool's goroutines hold a capacity token at boot; the
+// rest sit parked on the shared lease channel, exactly as ready to receive
+// one, until resize (see resize.go) mints more.
+//
+// A THIRD loop, the adaptive-concurrency controller, joins that census —
+// making it 3 + MaxWorkers — but only when MaxWorkers is actually wider than
+// Workers: at MaxWorkers == Workers, Concurrency.Next is mathematically
+// constant, so a goroutine that would tick forever to recompute the same
+// answer simply does not start (see Start). A deployment that never sets
+// RUNMESH_MAX_WORKERS therefore gets the exact census this runtime has always
+// had — 2 + Workers — with nothing new running at all, which is what makes
+// adaptive sizing something an operator opts INTO rather than a behaviour
+// change to what shipped before it existed. There is no goroutine per job, no
+// goroutine per HTTP request beyond net/http's own, and no supervisor tree.
 package engine
 
 import (
@@ -48,6 +61,25 @@ type Config struct {
 	ReconcileBatch    int
 	MaxOutputBytes    int
 	Backoff           Backoff
+
+	// Adaptive concurrency. MaxWorkers is the ceiling the pool may grow to;
+	// Workers remains both the floor it never shrinks below and the size it
+	// starts at. MaxWorkers == Workers — what setDefaults falls back to —
+	// makes Concurrency.Next constant at Workers, which is the exact fixed
+	// pool every RUNMESH_WORKERS deployment already ran before this existed:
+	// adaptive sizing is something an operator opts INTO by widening the
+	// ceiling, never a behaviour change to what shipped before it.
+	MaxWorkers int
+	// ConcurrencyInterval is how often the controller reduces its window and
+	// decides. ConcurrencyErrorRate and ConcurrencyHeadroom feed Concurrency
+	// directly — see its doc for what each one means and why neither is
+	// floored to a non-zero default here the way ConcurrencyInterval and
+	// ConcurrencyStep are: a zero ErrorRate or Headroom is itself a real,
+	// intentional setting, the same way Backoff.Jitter's zero value is.
+	ConcurrencyInterval  time.Duration
+	ConcurrencyErrorRate float64
+	ConcurrencyHeadroom  float64
+	ConcurrencyStep      int
 	// Tools optionally restricts this engine to a subset of the registry. It
 	// is how Week 3 splits in-process tools from container tools across
 	// separate worker fleets without a second scheduler.
@@ -58,7 +90,29 @@ func (c *Config) setDefaults() {
 	if c.Workers < 1 {
 		c.Workers = 1
 	}
-	if c.ClaimBatch < 1 || c.ClaimBatch > c.Workers {
+	// MaxWorkers is resolved before ClaimBatch on purpose: a directly-
+	// constructed Config that does not mention MaxWorkers at all — which,
+	// before this feature, was every Config there was — gets MaxWorkers ==
+	// Workers here, below Workers being nonsensical (the pool would start
+	// above its own ceiling) and corrected up rather than validated, the same
+	// treatment ClaimBatch gets against it next. Config.Validate enforces the
+	// same floor for a Config that DID set one, so this branch only ever
+	// fires for a caller that left it unset.
+	if c.MaxWorkers < c.Workers {
+		c.MaxWorkers = c.Workers
+	}
+	if c.ConcurrencyInterval <= 0 {
+		c.ConcurrencyInterval = 15 * time.Second
+	}
+	if c.ConcurrencyStep < 1 {
+		c.ConcurrencyStep = 1
+	}
+	// ClaimBatch's ceiling is MaxWorkers, not Workers: once adaptive sizing
+	// has grown the pool past Workers, a dispatcher still capped at claiming
+	// Workers leases per round trip just takes more round trips to fill the
+	// capacity it now has — not wrong, but the ceiling this validates against
+	// should be the same one the pool can actually reach.
+	if c.ClaimBatch < 1 || c.ClaimBatch > c.MaxWorkers {
 		c.ClaimBatch = c.Workers
 	}
 	if c.PollInterval <= 0 {
@@ -155,12 +209,24 @@ type Engine struct {
 	// already waiting, so a claimed step is never sitting in a queue nobody is
 	// accounting for. Closed by the dispatcher, and only by the dispatcher.
 	leases chan runmesh.Lease
-	// idle holds one token per free worker. Buffered to Workers and never
+	// idle holds one token per free worker. Buffered to MaxWorkers — not
+	// Workers, since resize may mint tokens up to that ceiling — and never
 	// closed, because it has many senders.
 	idle chan struct{}
 
+	// size is the pool's current target: Config.Workers at boot, moved only by
+	// resize. retireDebt is how many tokens returning to idle (returnToken)
+	// must be swallowed instead of returned before actual circulation catches
+	// up with size. window accumulates AttemptSettled evidence between
+	// controller ticks; concurrency is the pure policy consulted on each one,
+	// built once from cfg and never mutated after. See resize.go.
+	size        atomic.Int64
+	retireDebt  atomic.Int64
+	window      *concurrencyAccumulator
+	concurrency Concurrency
+
 	wg      sync.WaitGroup // worker pool
-	wgLoops sync.WaitGroup // dispatcher and reconciler
+	wgLoops sync.WaitGroup // dispatcher, reconciler and the concurrency controller
 
 	cancelClaim context.CancelFunc // stops taking on new work
 	cancelHard  context.CancelFunc // kills work already in flight
@@ -200,7 +266,7 @@ func New(cfg Config, d Deps) (*Engine, error) {
 	}
 	cfg.setDefaults()
 
-	return &Engine{
+	e := &Engine{
 		cfg:          cfg,
 		store:        d.Store,
 		exec:         d.Executor,
@@ -209,11 +275,21 @@ func New(cfg Config, d Deps) (*Engine, error) {
 		clock:        d.Clock,
 		log:          d.Log.With("component", "engine"),
 		leases:       make(chan runmesh.Lease),
-		idle:         make(chan struct{}, cfg.Workers),
+		idle:         make(chan struct{}, cfg.MaxWorkers),
 		shutdownDone: make(chan struct{}),
 		workersDone:  make(chan struct{}),
 		inflight:     make(map[string]runmesh.Lease),
-	}, nil
+		window:       &concurrencyAccumulator{},
+		concurrency: Concurrency{
+			Min: cfg.Workers, Max: cfg.MaxWorkers,
+			ErrorRate: cfg.ConcurrencyErrorRate, Headroom: cfg.ConcurrencyHeadroom,
+			Step: cfg.ConcurrencyStep,
+		},
+	}
+	// Not part of the literal: atomic.Int64 has no exported way to construct
+	// one already holding a value.
+	e.size.Store(int64(cfg.Workers))
+	return e, nil
 }
 
 // Start launches the reconciler, the dispatcher and the worker pool.
@@ -240,9 +316,18 @@ func (e *Engine) Start(ctx context.Context) error {
 
 	// Add is called once, before any goroutine exists, so an Add can never
 	// race a Wait — the classic WaitGroup misuse this shape rules out.
-	e.wg.Add(e.cfg.Workers)
-	for i := range e.cfg.Workers {
-		e.idle <- struct{}{}
+	//
+	// Every one of MaxWorkers goroutines starts now — the census is fixed at
+	// boot, per the package doc — but only the first Workers of them start
+	// holding a capacity token. The rest are already parked on `range
+	// e.leases`, exactly as able to receive a lease as any other, waiting for
+	// resize to mint the tokens that make that happen. Which index gets a
+	// seed token is arbitrary; only the COUNT (Workers, out of MaxWorkers) is.
+	e.wg.Add(e.cfg.MaxWorkers)
+	for i := range e.cfg.MaxWorkers {
+		if i < e.cfg.Workers {
+			e.idle <- struct{}{}
+		}
 		go e.runWorker(hardCtx, i)
 	}
 
@@ -253,8 +338,25 @@ func (e *Engine) Start(ctx context.Context) error {
 	}()
 	go e.runReconciler(claimCtx)
 
+	// The controller only ever starts when it has a range to work in. At
+	// MaxWorkers == Workers, Concurrency.Next is mathematically constant (see
+	// its own doc), so a goroutine ticking every ConcurrencyInterval to compute
+	// the same answer forever is pure overhead — for production, and for every
+	// test built before this feature existed, which is the sharper reason.
+	// clock.Fake counts registered waiters, and several existing tests
+	// synchronise on an EXACT count via BlockUntilContext; an always-on ticker
+	// this goroutine would register adds one to that count for the rest of the
+	// process and desyncs every one of them. Gating it on the ceiling actually
+	// being wider keeps the fake clock's waiter census identical to what it was
+	// before this feature existed, for the deployments and the tests that never
+	// asked for it.
+	if e.cfg.MaxWorkers > e.cfg.Workers {
+		e.wgLoops.Add(1)
+		go e.runConcurrency(claimCtx)
+	}
+
 	e.log.Info("engine started",
-		"workers", e.cfg.Workers, "claim_batch", e.cfg.ClaimBatch,
+		"workers", e.cfg.Workers, "max_workers", e.cfg.MaxWorkers, "claim_batch", e.cfg.ClaimBatch,
 		"lease_ttl", e.cfg.LeaseTTL.String(), "owner", e.cfg.Owner)
 	return nil
 }
@@ -347,8 +449,18 @@ func (e *Engine) drain(ctx context.Context) {
 	}
 }
 
-// Workers reports the configured size of the worker pool.
-func (e *Engine) Workers() int { return e.cfg.Workers }
+// Workers reports the pool's CURRENT target size: Config.Workers at boot,
+// and wherever the adaptive controller has since moved it (see resize.go),
+// always within [Config.Workers, Config.MaxWorkers]. A deployment that never
+// sets RUNMESH_MAX_WORKERS has MaxWorkers == Workers, so this reads exactly
+// as it always has — "the configured size" — for every caller that predates
+// adaptive sizing, this package's own tests included.
+func (e *Engine) Workers() int { return int(e.size.Load()) }
+
+// MaxWorkers reports the ceiling adaptive sizing may not cross. Unlike
+// Workers it never changes after Start: MaxWorkers is the shape of the pool
+// (how many goroutines exist), Workers is how many of them are lit up.
+func (e *Engine) MaxWorkers() int { return e.cfg.MaxWorkers }
 
 // Inflight reports how many steps are executing right now.
 func (e *Engine) Inflight() int {
@@ -392,7 +504,7 @@ type Stats struct {
 // Stats returns a snapshot of the engine's counters.
 func (e *Engine) Stats() Stats {
 	return Stats{
-		Workers:       e.cfg.Workers,
+		Workers:       e.Workers(),
 		Inflight:      e.Inflight(),
 		ClaimErrors:   e.claimErrors.Load(),
 		LeasesExpired: e.leasesExpired.Load(),

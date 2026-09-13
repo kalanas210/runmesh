@@ -53,6 +53,21 @@ type Config struct {
 	ReconcileInterval time.Duration
 	ReconcileBatch    int
 
+	// Adaptive concurrency: size the worker pool from observed latency and
+	// errors instead of holding it at Workers forever. MaxWorkers is the
+	// ceiling; Workers stays the floor and the starting size. MaxWorkers
+	// defaults to Workers, which makes the controller a no-op — the exact
+	// fixed pool every deployment ran before this existed — so an operator
+	// opts IN by widening the ceiling rather than opting out of a behaviour
+	// change. See internal/engine.Concurrency for what ErrorRate and Headroom
+	// decide and why neither is defaulted away from zero the way
+	// ConcurrencyInterval and ConcurrencyStep are.
+	MaxWorkers           int
+	ConcurrencyInterval  time.Duration
+	ConcurrencyErrorRate float64
+	ConcurrencyHeadroom  float64
+	ConcurrencyStep      int
+
 	// Retry
 	BackoffBase   time.Duration
 	BackoffMax    time.Duration
@@ -198,6 +213,20 @@ func Load(getenv func(string) string) (Config, error) {
 		ReconcileInterval: l.dur("RUNMESH_RECONCILE_INTERVAL", 10*time.Second),
 		ReconcileBatch:    l.num("RUNMESH_RECONCILE_BATCH", 100),
 
+		// 0 means "no ceiling above Workers"; resolved below, once Workers is
+		// known, for the same reason ClaimBatch is. RUNMESH_MAX_WORKERS=0
+		// therefore cannot mean "unlimited" — it means "not set" — the same
+		// choice ClaimBatch and DBMaxOpenConns already made for their own zero.
+		MaxWorkers:          l.num("RUNMESH_MAX_WORKERS", 0),
+		ConcurrencyInterval: l.dur("RUNMESH_CONCURRENCY_INTERVAL", 15*time.Second),
+		// Unlike the two above, 0 here is not "not set" — it is a real answer
+		// ("never shrink on errors" / "any latency above baseline pauses
+		// growth"), the same way RUNMESH_BACKOFF_JITTER=0 is a real answer.
+		// 0.2 and 0.5 are simply what an operator gets if they never say.
+		ConcurrencyErrorRate: l.float("RUNMESH_CONCURRENCY_ERROR_RATE", 0.2),
+		ConcurrencyHeadroom:  l.float("RUNMESH_CONCURRENCY_HEADROOM", 0.5),
+		ConcurrencyStep:      l.num("RUNMESH_CONCURRENCY_STEP", 1),
+
 		BackoffBase:   l.dur("RUNMESH_BACKOFF_BASE", time.Second),
 		BackoffMax:    l.dur("RUNMESH_BACKOFF_MAX", 60*time.Second),
 		BackoffFactor: l.float("RUNMESH_BACKOFF_FACTOR", 2.0),
@@ -310,6 +339,13 @@ func Load(getenv func(string) string) (Config, error) {
 		StreamWriteTimeout: l.dur("RUNMESH_STREAM_WRITE_TIMEOUT", 0),
 	}
 	c.APIKeys = l.apiKeys("RUNMESH_API_KEYS")
+	// Resolved before ClaimBatch and DBMaxOpenConns, which are both bounded by
+	// it rather than by Workers from here on: once adaptive sizing can grow
+	// the pool past Workers, a claim batch or a connection pool still capped
+	// at Workers is a ceiling on the feature this config exists to enable.
+	if c.MaxWorkers == 0 {
+		c.MaxWorkers = c.Workers
+	}
 	if c.ClaimBatch == 0 {
 		c.ClaimBatch = c.Workers
 	}
@@ -317,8 +353,10 @@ func Load(getenv func(string) string) (Config, error) {
 	// dispatcher claiming, the reconciler sweeping, and a readiness probe. Size
 	// it below that and a drain can deadlock: every connection held by a worker
 	// waiting to write, and no connection left for the dispatcher to notice.
+	// MaxWorkers, not Workers: adaptive sizing can grow the pool that far, and
+	// every one of those workers can hold a connection at once too.
 	if c.DBMaxOpenConns == 0 {
-		c.DBMaxOpenConns = c.Workers + dbConnHeadroom
+		c.DBMaxOpenConns = c.MaxWorkers + dbConnHeadroom
 	}
 	if c.DBMaxIdleConns == 0 {
 		c.DBMaxIdleConns = c.DBMaxOpenConns
@@ -364,8 +402,26 @@ func (c Config) Validate() []error {
 	if c.Workers < 1 {
 		bad("RUNMESH_WORKERS must be >= 1, got %d", c.Workers)
 	}
-	if c.ClaimBatch < 1 || c.ClaimBatch > c.Workers {
-		bad("RUNMESH_CLAIM_BATCH must be in [1, RUNMESH_WORKERS=%d], got %d", c.Workers, c.ClaimBatch)
+	// Below Workers, the pool would start above its own ceiling. Equal to it
+	// is the default and makes adaptive sizing a no-op; above it is the
+	// opt-in.
+	if c.MaxWorkers < c.Workers {
+		bad("RUNMESH_MAX_WORKERS must be >= RUNMESH_WORKERS=%d, got %d", c.Workers, c.MaxWorkers)
+	}
+	if c.ClaimBatch < 1 || c.ClaimBatch > c.MaxWorkers {
+		bad("RUNMESH_CLAIM_BATCH must be in [1, RUNMESH_MAX_WORKERS=%d], got %d", c.MaxWorkers, c.ClaimBatch)
+	}
+	if c.ConcurrencyInterval <= 0 {
+		bad("RUNMESH_CONCURRENCY_INTERVAL must be > 0, got %s", c.ConcurrencyInterval)
+	}
+	if c.ConcurrencyErrorRate < 0 || c.ConcurrencyErrorRate > 1 {
+		bad("RUNMESH_CONCURRENCY_ERROR_RATE must be in [0, 1], got %v", c.ConcurrencyErrorRate)
+	}
+	if c.ConcurrencyHeadroom < 0 {
+		bad("RUNMESH_CONCURRENCY_HEADROOM must be >= 0, got %v", c.ConcurrencyHeadroom)
+	}
+	if c.ConcurrencyStep < 1 {
+		bad("RUNMESH_CONCURRENCY_STEP must be >= 1, got %d", c.ConcurrencyStep)
 	}
 	if c.PollInterval <= 0 {
 		bad("RUNMESH_POLL_INTERVAL must be > 0, got %s", c.PollInterval)
@@ -430,11 +486,12 @@ func (c Config) Validate() []error {
 		bad("RUNMESH_MAX_STEPS must be >= 1, got %d", c.Limits.MaxSteps)
 	}
 	if c.DatabaseURL != "" {
-		if c.DBMaxOpenConns < c.Workers+dbConnHeadroom {
-			bad("RUNMESH_DB_MAX_OPEN_CONNS must be at least RUNMESH_WORKERS + %d = %d, got %d "+
-				"(every worker may hold a connection to settle its outcome while the "+
-				"dispatcher, the reconciler and a readiness probe still need one)",
-				dbConnHeadroom, c.Workers+dbConnHeadroom, c.DBMaxOpenConns)
+		if c.DBMaxOpenConns < c.MaxWorkers+dbConnHeadroom {
+			bad("RUNMESH_DB_MAX_OPEN_CONNS must be at least RUNMESH_MAX_WORKERS + %d = %d, got %d "+
+				"(every worker up to the adaptive ceiling may hold a connection to settle "+
+				"its outcome while the dispatcher, the reconciler and a readiness probe "+
+				"still need one)",
+				dbConnHeadroom, c.MaxWorkers+dbConnHeadroom, c.DBMaxOpenConns)
 		}
 		if c.DBMaxIdleConns < 1 || c.DBMaxIdleConns > c.DBMaxOpenConns {
 			bad("RUNMESH_DB_MAX_IDLE_CONNS must be in [1, RUNMESH_DB_MAX_OPEN_CONNS=%d], got %d",

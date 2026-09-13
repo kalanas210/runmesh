@@ -18,11 +18,13 @@ import (
 //
 // Deadlock argument, in full. The dispatcher blocks only on <-idle and on
 // leases <-, and both are in a select with ctx.Done(). Workers block only on
-// range leases (released by close) and on idle <- (a buffer of Workers with at
-// most Workers tokens in existence, so it never blocks). Every store call
-// carries a bounded context. There is no cycle in the wait-for graph, and the
-// HTTP handlers are not in the graph at all: they write to the store and
-// return.
+// range leases (released by close) and, inside returnToken, on idle <- (a
+// buffer of MaxWorkers with at most MaxWorkers tokens ever alive — resize.go's
+// resize never mints past that ceiling — so it never blocks; a shrink retires
+// a token instead of sending it, which is a CAS and never a send at all).
+// Every store call carries a bounded context. There is no cycle in the
+// wait-for graph, and the HTTP handlers are not in the graph at all: they
+// write to the store and return.
 func (e *Engine) runDispatcher(ctx context.Context) {
 	defer close(e.leases) // the dispatcher is the ONLY closer of this channel
 	tick := e.clock.NewTicker(e.cfg.PollInterval)
@@ -127,11 +129,16 @@ func (e *Engine) acquire(ctx context.Context) (int, bool) {
 	return n, true
 }
 
-// giveBack returns unused capacity. It can never block: the channel's buffer
-// is Workers and at most Workers tokens exist.
+// giveBack returns unused capacity, one token at a time, through returnToken
+// — so a claim round trip that asked for more than it used hands the same
+// tokens the adaptive controller may be shrinking through, back to the same
+// place. It can never block: idle's buffer is MaxWorkers and at most
+// MaxWorkers tokens are ever alive, a size resize.go's resize maintains by
+// construction (it only ever mints up to size(), which is itself clamped to
+// MaxWorkers).
 func (e *Engine) giveBack(n int) {
 	for range n {
-		e.idle <- struct{}{}
+		e.returnToken()
 	}
 }
 

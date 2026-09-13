@@ -72,7 +72,7 @@ goal ──▶ planner ──▶ validated plan ──▶ RunMesh ──▶ isol
 
 ### Execution
 - **Dependency graphs.** Steps declare `depends_on`; readiness is a query predicate, not a stored state.
-- **Bounded concurrency.** A worker pool, and a dispatcher that only claims as many steps as it has idle workers.
+- **Bounded, adaptive concurrency.** A worker pool, and a dispatcher that only claims as many steps as it has idle workers. The pool itself can size between `RUNMESH_WORKERS` and `RUNMESH_MAX_WORKERS`: it grows one worker at a time while attempts are healthy, and halves the instant a window's error rate crosses a threshold — never below the configured floor. Off by default; a deployment that never sets `RUNMESH_MAX_WORKERS` gets the exact fixed pool it always had.
 - **Timeouts and retries.** Per-step timeouts, exponential backoff with jitter (1 s doubling to at most 60 s by default), and a per-step attempt budget.
 - **Cancellation across replicas.** Waiting steps are cancelled at once; running steps learn on their next heartbeat, and their Kubernetes Jobs are deleted.
 - **Idempotent submission** with `Idempotency-Key`, and job priorities that order the queue.
@@ -541,16 +541,16 @@ The choices with real alternatives are written down as ADRs in
 | [0011](docs/decisions/0011-the-model-chooses-the-runtime-decides.md) | The model chooses; the runtime decides |
 | [0012](docs/decisions/0012-metrics-without-a-client-library.md) | Metrics without a client library |
 | [0013](docs/decisions/0013-server-sent-events-not-websockets.md) | Server-Sent Events, not WebSockets |
+| [0014](docs/decisions/0014-worker-pool-size-is-adaptive.md) | The worker pool sizes itself between Workers and MaxWorkers |
 
 ---
 
 ## Roadmap
 
 Done: the runtime, durable state, Kubernetes isolation, the Gemini planner,
-observability, the dashboard, recovery from crashes and lost workloads, failure details from task containers, readable reports, and a multi-node test cluster.
+observability, the dashboard, recovery from crashes and lost workloads, failure details from task containers, readable reports, a multi-node test cluster, and adaptive concurrency.
 Next:
 
-- [ ] **Adaptive concurrency.** Size the worker pool from observed latency and errors, instead of a fixed `RUNMESH_WORKERS`.
 - [ ] **Rate limiting.** Redis-backed limits per tool and per external host, shared across replicas.
 - [ ] **Cloud deployment.** Manifests for running RunMesh itself on managed Kubernetes with managed PostgreSQL.
 

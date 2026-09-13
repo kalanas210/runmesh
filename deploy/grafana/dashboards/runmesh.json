@@ -285,7 +285,7 @@
       "id": 4,
       "type": "stat",
       "title": "Pool saturation",
-      "description": "runmesh_workers_inflight / runmesh_workers.\n\nPinned at 100% with a non-zero queue depth is the one unambiguous 'raise RUNMESH_WORKERS' signal on this dashboard.",
+      "description": "runmesh_workers_inflight / runmesh_workers.\n\nPinned at 100% with a non-zero queue depth used to be the one unambiguous 'raise RUNMESH_WORKERS' signal on this dashboard. With RUNMESH_MAX_WORKERS set above RUNMESH_WORKERS the pool raises itself, up to runmesh_workers_max; pinned at 100% while runmesh_workers is already at runmesh_workers_max is the signal now, and means the ceiling itself needs raising.",
       "datasource": {
         "type": "prometheus",
         "uid": "runmesh-prometheus"

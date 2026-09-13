@@ -397,6 +397,12 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 		ReconcileInterval: cfg.ReconcileInterval,
 		ReconcileBatch:    cfg.ReconcileBatch,
 		MaxOutputBytes:    cfg.MaxOutputBytes,
+
+		MaxWorkers:           cfg.MaxWorkers,
+		ConcurrencyInterval:  cfg.ConcurrencyInterval,
+		ConcurrencyErrorRate: cfg.ConcurrencyErrorRate,
+		ConcurrencyHeadroom:  cfg.ConcurrencyHeadroom,
+		ConcurrencyStep:      cfg.ConcurrencyStep,
 		Backoff: engine.Backoff{
 			Base:   cfg.BackoffBase,
 			Max:    cfg.BackoffMax,

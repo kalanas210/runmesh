@@ -52,6 +52,9 @@ type Set struct {
 	sweeps        *CounterVec
 	sweepDuration *Histogram
 
+	// ---- adaptive concurrency
+	concurrencyAdjustments *CounterVec
+
 	// ---- store
 	storeDuration *HistogramVec
 	storeErrors   *CounterVec
@@ -142,6 +145,7 @@ var (
 	heartbeatOut   = []string{"ok", "lease_lost", "cancel", "error"}
 	sweepOutcomes  = []string{"ok", "error"}
 	reclaimedState = []string{runmesh.Queued.String(), runmesh.Failed.String()}
+	sizeDirections = []string{"grow", "shrink"}
 
 	storeOps = []string{
 		"claim", "start", "heartbeat", "finish", "release", "expire_leases", "queue_depth",
@@ -323,6 +327,19 @@ func NewSet(r *Registry, v Vocabulary) *Set {
 		Help: "Time one Store.ExpireLeases sweep took.",
 	}, bucketsIO)
 
+	// ------------------------------------------------------ adaptive concurrency
+	//
+	// Not a gauge: the LEVEL is already runmesh_workers (see gauges.go), and a
+	// gauge fed from the same events this counts would be the two-paths-to-
+	// one-number drift this file's own doc warns about. What this adds is the
+	// thing a level cannot show — the RATE a real move happens at, cut by
+	// direction — which is the hint/tick split runmesh_dispatcher_wakeups_total
+	// already makes for the same reason.
+	s.concurrencyAdjustments = r.CounterVec(Opts{
+		Name: "runmesh_concurrency_adjustments_total",
+		Help: "Adaptive-sizing decisions that actually moved the worker pool, by direction. runmesh_workers is the level this is the rate of.",
+	}, Label{Name: "direction", Values: sizeDirections})
+
 	// ---------------------------------------------------------------- store
 	s.storeDuration = r.HistogramVec(Opts{
 		Name: "runmesh_store_operation_duration_seconds",
@@ -467,6 +484,17 @@ func (s *Set) SweepFinished(reclaimed int, d time.Duration, err error) {
 	}
 	s.sweeps.With(outcome).Inc()
 	s.sweepDuration.ObserveDuration(d)
+}
+
+// ConcurrencyAdjusted records one adaptive-sizing decision. The engine only
+// ever calls this when the target actually moved (see engine.Observer's
+// doc), so there is no "unchanged" direction to label here.
+func (s *Set) ConcurrencyAdjusted(from, to int) {
+	direction := "grow"
+	if to < from {
+		direction = "shrink"
+	}
+	s.concurrencyAdjustments.With(direction).Inc()
 }
 
 // ------------------------------------------------------------- other seams

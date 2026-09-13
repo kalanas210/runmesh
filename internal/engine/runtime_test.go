@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"sync"
@@ -53,6 +54,24 @@ func withWorkers(n int) option {
 
 func withBackoff(b engine.Backoff) option {
 	return func(c *engine.Config, _ *engine.Deps) { c.Backoff = b }
+}
+
+func withMaxWorkers(n int) option {
+	return func(c *engine.Config, _ *engine.Deps) { c.MaxWorkers = n }
+}
+
+// withConcurrencyPolicy sets every knob the adaptive controller reads, so a
+// test can pick an interval the fake clock advances by exactly, an error
+// rate low enough that one bad window trips it, and a headroom generous
+// enough that the healthy phase's own latency never accidentally holds
+// growth by itself.
+func withConcurrencyPolicy(interval time.Duration, errorRate, headroom float64, step int) option {
+	return func(c *engine.Config, _ *engine.Deps) {
+		c.ConcurrencyInterval = interval
+		c.ConcurrencyErrorRate = errorRate
+		c.ConcurrencyHeadroom = headroom
+		c.ConcurrencyStep = step
+	}
 }
 
 func withSandbox(s engine.Sandbox) option {
@@ -205,6 +224,15 @@ func stepEvent(t runmesh.EventType, stepID string) func(runmesh.Event) bool {
 }
 
 func jobFinished(e runmesh.Event) bool { return e.Type == runmesh.JobFinished }
+
+// stepFinishedAs matches a StepFinished event that landed in a specific
+// State, which StepFinished's own Type does not distinguish — success,
+// failure, timeout and cancellation all share it, with State carrying which.
+func stepFinishedAs(state runmesh.State, stepID string) func(runmesh.Event) bool {
+	return func(e runmesh.Event) bool {
+		return e.Type == runmesh.StepFinished && e.StepID == stepID && e.State == state
+	}
+}
 
 func (h *harness) job(id string) *runmesh.Job {
 	h.t.Helper()
@@ -1372,13 +1400,25 @@ type recordingObserver struct {
 	sweeps      int
 	sweepErrors int
 	sweptTotal  int
+
+	concurrency []concurrencyAdjustment
+	// adjusted mirrors concurrency as a channel, so a test can block for the
+	// NEXT adjustment instead of polling the slice above. Buffered generously
+	// and fed by a non-blocking send: like every other method here this must
+	// not risk blocking an engine goroutine, and a test that cares which
+	// adjustment arrived reads awaitAdjustment's return value rather than
+	// assuming the channel and the slice are the same length.
+	adjusted chan concurrencyAdjustment
 }
+
+type concurrencyAdjustment struct{ from, to int }
 
 func newRecordingObserver() *recordingObserver {
 	return &recordingObserver{
 		wokeOn:     map[string]int{},
 		heartbeats: map[string]int{},
 		reclaimed:  map[runmesh.State]int{},
+		adjusted:   make(chan concurrencyAdjustment, 64),
 	}
 }
 
@@ -1442,6 +1482,32 @@ func (o *recordingObserver) SweepFinished(n int, _ time.Duration, err error) {
 	o.sweptTotal += n
 	if err != nil {
 		o.sweepErrors++
+	}
+}
+
+func (o *recordingObserver) ConcurrencyAdjusted(from, to int) {
+	adj := concurrencyAdjustment{from, to}
+	o.mu.Lock()
+	o.concurrency = append(o.concurrency, adj)
+	o.mu.Unlock()
+	select {
+	case o.adjusted <- adj:
+	default:
+	}
+}
+
+// awaitAdjustment blocks for the next ConcurrencyAdjusted call, the same way
+// harness.await blocks for the next matching event — a real channel rather
+// than a poll loop, so a test that calls it right after the clock advance
+// that should trigger one has no timing window to race.
+func (o *recordingObserver) awaitAdjustment(t *testing.T) concurrencyAdjustment {
+	t.Helper()
+	select {
+	case adj := <-o.adjusted:
+		return adj
+	case <-t.Context().Done():
+		t.Fatal("timed out waiting for a concurrency adjustment")
+		return concurrencyAdjustment{}
 	}
 }
 
@@ -1822,5 +1888,144 @@ func settledWhenTheStoreWriteFails(t *testing.T) {
 	if got := h.job("job_lost_write").Step("a").State; got != runmesh.Running {
 		t.Errorf("the step is %s, want RUNNING: the injected fault was supposed to "+
 			"lose the outcome", got)
+	}
+}
+
+// ------------------------------------------------------ adaptive concurrency
+//
+// The policy itself — every shape Concurrency.Next can decide — is table-
+// tested in concurrency_test.go with no goroutine involved. What these tests
+// prove is the WIRING: that real AttemptSettled calls from real workers
+// accumulate into a real window, that a real tick reduces it and calls
+// resize, and that resize actually moves Workers() and IdleWorkers() rather
+// than just the number Next() would have returned in isolation.
+
+// TestAdaptiveConcurrencyDisabledByDefault pins the backward-compatibility
+// promise this whole feature rests on: an engine.Config built the way every
+// caller before this feature built one — Workers set, MaxWorkers never
+// mentioned — gets a pool whose ceiling equals its floor. Checked before
+// Start is ever called and with no goroutine involved, because this is a
+// property of New and setDefaults alone.
+func TestAdaptiveConcurrencyDisabledByDefault(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, tools.Registry{"echo": tools.Echo{}}, withWorkers(5))
+	if got := h.eng.Workers(); got != 5 {
+		t.Errorf("Workers() = %d, want 5", got)
+	}
+	if got := h.eng.MaxWorkers(); got != 5 {
+		t.Errorf("MaxWorkers() = %d, want 5 (defaults to Workers)", got)
+	}
+}
+
+// TestAdaptiveConcurrencyGrowsThenShrinks runs the pool through both AIMD
+// halves against a real dispatcher, real workers and a real Observer.
+//
+// Synchronisation has no sleep and no poll anywhere in it. Awaiting every
+// StepFinished event before advancing the clock is enough to guarantee every
+// one of those attempts already reached recordConcurrency, because settle
+// calls it BEFORE it does anything else — including the store write the
+// event is published from (see worker.go) — so by the time an event for
+// attempt N is observable, attempt N's contribution to the window is already
+// in it. And obs.awaitAdjustment blocks on the same kind of real channel
+// harness.await does, so there is no window after Advance where the
+// controller goroutine has been sent a tick but has not finished acting on
+// it yet.
+func TestAdaptiveConcurrencyGrowsThenShrinks(t *testing.T) {
+	t.Parallel()
+	obs := newRecordingObserver()
+	h := newHarness(t, tools.Registry{"echo": tools.Echo{}, "flaky": flaky{failUntil: 999, kind: "fatal"}},
+		withWorkers(2), withMaxWorkers(8),
+		withConcurrencyPolicy(time.Second, 0.5, 1.0, 1),
+		withObserver(obs))
+
+	if err := h.eng.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Phase 1: a window of clean successes grows the pool by exactly one Step.
+	const healthy = 12
+	for i := range healthy {
+		h.submit(fmt.Sprintf("job_grow_%d", i), []runmesh.PlanStep{echoStep("s")}, runmesh.FailFast)
+	}
+	for range healthy {
+		h.await(stepFinishedAs(runmesh.Succeeded, "s"), "a healthy step to succeed")
+	}
+
+	h.clk.Advance(time.Second)
+	grow := obs.awaitAdjustment(t)
+	if grow.from != 2 {
+		t.Fatalf("grow.from = %d, want the starting pool of 2", grow.from)
+	}
+	if grow.to != 3 {
+		t.Fatalf("grow.to = %d, want exactly one Step above %d", grow.to, grow.from)
+	}
+	if got := h.eng.Workers(); got != 3 {
+		t.Errorf("Workers() after growth = %d, want 3", got)
+	}
+
+	// Phase 2: a window that is entirely failures halves it. ErrorRate is 0.5,
+	// so an all-failing window trips it several times over — the assertion is
+	// only that it DOES trip, and that the halving lands exactly where
+	// Concurrency.Next says it must for the grown pool of 3.
+	const failing = 6
+	for i := range failing {
+		h.submit(fmt.Sprintf("job_shrink_%d", i),
+			[]runmesh.PlanStep{{ID: "f", Tool: "flaky", MaxAttempts: 1}}, runmesh.FailFast)
+	}
+	for range failing {
+		h.await(stepFinishedAs(runmesh.Failed, "f"), "a failing step to fail")
+	}
+
+	h.clk.Advance(time.Second)
+	shrink := obs.awaitAdjustment(t)
+	if shrink.from != 3 {
+		t.Fatalf("shrink.from = %d, want the grown pool of 3", shrink.from)
+	}
+	if want := (shrink.from + 1) / 2; shrink.to != want {
+		t.Errorf("shrink.to = %d, want the halved %d", shrink.to, want)
+	}
+	if got := h.eng.Workers(); got != shrink.to {
+		t.Errorf("Workers() after shrink = %d, want %d", got, shrink.to)
+	}
+}
+
+// TestAdaptiveConcurrencyNeverExceedsMaxWorkers: a Step large enough to
+// overshoot the ceiling in one tick if it were not clamped still stops
+// exactly at MaxWorkers, and IdleWorkers never reports more free capacity
+// than the ceiling allows either — proof that the tokens resize minted are
+// real ones a worker can actually take, not just a number Workers() reports.
+func TestAdaptiveConcurrencyNeverExceedsMaxWorkers(t *testing.T) {
+	t.Parallel()
+	obs := newRecordingObserver()
+	h := newHarness(t, tools.Registry{"echo": tools.Echo{}},
+		withWorkers(2), withMaxWorkers(3),
+		withConcurrencyPolicy(time.Second, 0.5, 1.0, 2), // Step=2 would overshoot 3 from 2
+		withObserver(obs))
+
+	if err := h.eng.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	const healthy = 6
+	for i := range healthy {
+		h.submit(fmt.Sprintf("job_ceil_%d", i), []runmesh.PlanStep{echoStep("s")}, runmesh.FailFast)
+	}
+	for range healthy {
+		h.await(stepFinishedAs(runmesh.Succeeded, "s"), "a healthy step to succeed")
+	}
+
+	h.clk.Advance(time.Second)
+	adj := obs.awaitAdjustment(t)
+	if adj.to != 3 {
+		t.Fatalf("to = %d, want clamped to MaxWorkers=3 despite Step=2 from 2", adj.to)
+	}
+	if got := h.eng.Workers(); got != 3 {
+		t.Errorf("Workers() = %d, want 3", got)
+	}
+	if got := h.eng.MaxWorkers(); got != 3 {
+		t.Errorf("MaxWorkers() = %d, want 3", got)
+	}
+	if got := h.eng.IdleWorkers(); got > 3 {
+		t.Errorf("IdleWorkers() = %d, above the ceiling of 3", got)
 	}
 }

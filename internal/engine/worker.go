@@ -31,7 +31,7 @@ func (e *Engine) runWorker(hard context.Context, id int) {
 	log := e.log.With("worker", id)
 	for l := range e.leases {
 		e.guarded(hard, log, l)
-		e.idle <- struct{}{}
+		e.returnToken() // ordinarily idle <- struct{}{}; see resize.go
 	}
 }
 
@@ -299,6 +299,12 @@ func (e *Engine) settle(hard context.Context, log *slog.Logger, l runmesh.Lease,
 	if d.Error != nil {
 		settled.Code = d.Error.Code
 	}
+	// Fed from the SAME value every branch below reports to the Observer, so
+	// the adaptive controller's window can never disagree with what the
+	// "step settled" log line or a dashboard says happened. concurrencySignal
+	// (resize.go) is what excludes a Discard or a drain-time Release from
+	// counting as evidence either way.
+	e.recordConcurrency(settled)
 
 	if d.Discard {
 		e.obs.AttemptSettled(settled)

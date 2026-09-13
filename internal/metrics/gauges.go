@@ -27,6 +27,12 @@ type Runtime interface {
 	Workers() int
 	Inflight() int
 	IdleWorkers() int
+	// MaxWorkers is the ceiling adaptive sizing may not cross. It is static —
+	// unlike the other three, its value never changes after Start — but it
+	// travels through this interface anyway rather than as a closure over a
+	// config value in run(), so the engine stays the one place the pool's
+	// shape is defined.
+	MaxWorkers() int
 }
 
 // StoreSource is the slice of the store this package needs.
@@ -99,8 +105,17 @@ func (s *Set) BindStreams(st Streams) { s.streamSrc.set(st) }
 func (s *Set) registerGauges(r *Registry) {
 	r.GaugeFunc(Opts{
 		Name: "runmesh_workers",
-		Help: "Configured size of the worker pool.",
+		Help: "Current size of the worker pool. Fixed at RUNMESH_WORKERS unless RUNMESH_MAX_WORKERS raises the ceiling above it, in which case adaptive sizing moves this between runmesh_workers (its floor, unlabelled here) and runmesh_workers_max.",
 	}, func() float64 { return float64(s.runtimeInt(func(rt Runtime) int { return rt.Workers() })) })
+
+	// Static — MaxWorkers never changes after Start — but exported as a gauge
+	// rather than a label on runmesh_workers, the same way build info gets its
+	// own series: a dashboard wants "how close to the ceiling is the pool"
+	// as a plain ratio of two series, not a join.
+	r.GaugeFunc(Opts{
+		Name: "runmesh_workers_max",
+		Help: "The ceiling adaptive sizing may not cross. Equals RUNMESH_WORKERS when RUNMESH_MAX_WORKERS is unset, which is what makes runmesh_workers == runmesh_workers_max the signal that adaptive sizing is effectively off.",
+	}, func() float64 { return float64(s.runtimeInt(func(rt Runtime) int { return rt.MaxWorkers() })) })
 
 	r.GaugeFunc(Opts{
 		Name: "runmesh_workers_inflight",

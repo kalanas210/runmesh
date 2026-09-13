@@ -72,6 +72,7 @@ func TestObserversAndRendererAreRaceFree(t *testing.T) {
 				s.DispatcherIdle("hint")
 				s.LeaseReclaimed(runmesh.Queued)
 				s.SweepFinished(1, 5000, nil)
+				s.ConcurrencyAdjusted(4, 5)
 				s.StoreOperation("claim", 6000, "")
 				s.RequestFinished("GET /api/v1/jobs", 200, 128, 7000)
 			}
@@ -96,6 +97,9 @@ func TestObserversAndRendererAreRaceFree(t *testing.T) {
 	}
 	if got := s.claimReq.Value(); got != 4*want {
 		t.Errorf("leases requested = %d, want %d", got, 4*want)
+	}
+	if got := s.concurrencyAdjustments.With("grow").Value(); got != want {
+		t.Errorf("concurrency adjustments = %d, want %d: increments were lost under contention", got, want)
 	}
 
 	// And the body still parses after all of that, which is the property a
@@ -136,6 +140,7 @@ func TestObserveIsAllocationFree(t *testing.T) {
 		{"DispatcherIdle", func() { s.DispatcherIdle("tick") }},
 		{"LeaseReclaimed", func() { s.LeaseReclaimed(runmesh.Queued) }},
 		{"SweepFinished", func() { s.SweepFinished(1, 1000, nil) }},
+		{"ConcurrencyAdjusted", func() { s.ConcurrencyAdjusted(4, 5) }},
 		{"StoreOperation", func() { s.StoreOperation("claim", 1000, "") }},
 		{"RequestFinished", func() { s.RequestFinished("GET /api/v1/jobs", 200, 64, 1000) }},
 	}

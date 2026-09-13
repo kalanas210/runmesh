@@ -8,7 +8,7 @@ import (
 
 // Observer is the engine's telemetry seam, declared HERE by its consumer for
 // the same reason Store and Sandbox are: internal/engine does not import
-// internal/metrics, and a test satisfies this with a struct of nine empty
+// internal/metrics, and a test satisfies this with a struct of ten empty
 // methods.
 //
 // Three things about it are load-bearing, and none of them is enforceable by
@@ -18,8 +18,11 @@ import (
 // ToolExecuted, AttemptSettled and Heartbeat run on a worker that is holding
 // one of the pool's capacity tokens; Claimed, Dispatched and DispatcherIdle run
 // on the single dispatcher; SweepFinished and LeaseReclaimed run on the
-// reconciler. An implementation that takes a lock, allocates per call, writes
-// to an unsynchronised map or logs does not make metrics slow — it SHRINKS THE
+// reconciler; ConcurrencyAdjusted runs on the adaptive controller, at most
+// once per ConcurrencyInterval, which is the one method here with headroom to
+// spare against this rule rather than needing every bit of it. An
+// implementation that takes a lock, allocates per call, writes to an
+// unsynchronised map or logs does not make metrics slow — it SHRINKS THE
 // WORKER POOL, and does so silently, showing up as reduced throughput with no
 // error anywhere. The shipped implementation is atomics plus one map read under
 // a read lock, and TestObserveIsAllocationFree asserts the allocation half with
@@ -90,6 +93,15 @@ type Observer interface {
 	// SweepFinished reports one reconciler sweep. reclaimed is zero when err is
 	// non-nil.
 	SweepFinished(reclaimed int, d time.Duration, err error)
+
+	// ConcurrencyAdjusted reports one adaptive-sizing decision: the pool's
+	// target moved from `from` workers to `to`. Called at most once per
+	// Config.ConcurrencyInterval, from the controller goroutine runConcurrency
+	// owns (resize.go), and only when the target actually changed — a tick
+	// that leaves size where it was is not a decision, and counting it would
+	// bury the rate a real move happens at under a rate a fixed pool would
+	// share.
+	ConcurrencyAdjusted(from, to int)
 }
 
 // AttemptOutcome is everything settle decided about one attempt, flattened into
@@ -130,5 +142,6 @@ func (nopObserver) AttemptSettled(AttemptOutcome)           {}
 func (nopObserver) Heartbeat(string, string)                {}
 func (nopObserver) LeaseReclaimed(runmesh.State)            {}
 func (nopObserver) SweepFinished(int, time.Duration, error) {}
+func (nopObserver) ConcurrencyAdjusted(int, int)            {}
 
 var _ Observer = nopObserver{}
