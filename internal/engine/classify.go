@@ -127,6 +127,14 @@ func Classify(stop Stop, err error, failures, maxAttempts int, b Backoff) Dispos
 			}
 			return Disposition{State: runmesh.Retrying, CountFail: true, RetryIn: d, Error: info}
 		}
+		if te.Code == runmesh.CodeTimeout {
+			// A timeout that arrived as an error rather than as StopTimeout: the
+			// Kubernetes backstop deadline, reported by the executor when
+			// RunMesh's own deadline did not fire first. The final one reports
+			// TIMED_OUT for the same reason the StopTimeout branch does, so a
+			// job says "this timed out" whichever clock noticed.
+			return Disposition{State: runmesh.TimedOut, CountFail: true, Error: info}
+		}
 		return Disposition{State: runmesh.Failed, CountFail: true, Error: info}
 	}
 
