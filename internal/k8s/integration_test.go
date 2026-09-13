@@ -40,18 +40,10 @@ const testTaskImage = "runmesh/task:dev"
 func integrationConfig(t *testing.T) (k8s.Config, *k8s.Executor) {
 	t.Helper()
 
-	kubecontext := os.Getenv("RUNMESH_TEST_KUBECONTEXT")
-	if kubecontext == "" {
-		t.Skip("set RUNMESH_TEST_KUBECONTEXT (e.g. kind-runmesh) to run the Kubernetes integration tests")
-	}
+	client := integrationClient(t)
 	image := os.Getenv("RUNMESH_TEST_TASK_IMAGE")
 	if image == "" {
 		image = testTaskImage
-	}
-
-	client, err := k8s.NewClient(os.Getenv("RUNMESH_TEST_KUBECONFIG"), kubecontext)
-	if err != nil {
-		t.Fatalf("connecting to %s: %v", kubecontext, err)
 	}
 
 	cfg := k8s.Config{
