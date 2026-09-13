@@ -279,7 +279,7 @@ func Load(getenv func(string) string) (Config, error) {
 		// variable, and RUNMESH_PLANNER is set once per deployment.
 		Planner:         l.str("RUNMESH_PLANNER", PlannerNone),
 		GeminiAPIKey:    l.str("RUNMESH_GEMINI_API_KEY", ""),
-		GeminiModel:     l.str("RUNMESH_GEMINI_MODEL", "gemini-2.0-flash"),
+		GeminiModel:     l.str("RUNMESH_GEMINI_MODEL", "gemini-3.6-flash"), // as gemini.DefaultModel
 		GeminiBaseURL:   l.str("RUNMESH_GEMINI_BASE_URL", ""),
 		GeminiTimeout:   l.dur("RUNMESH_GEMINI_TIMEOUT", 30*time.Second),
 		GeminiMaxTokens: l.num("RUNMESH_GEMINI_MAX_OUTPUT_TOKENS", 8192),

@@ -44,7 +44,14 @@ const DefaultBaseURL = "https://generativelanguage.googleapis.com"
 // DefaultModel is a small, fast, cheap model, and the plan's own advice is to
 // keep development off the expensive tier. Planning a five-step DAG from a
 // sentence is not a task that needs the largest model available.
-const DefaultModel = "gemini-2.0-flash"
+//
+// Model names are retired on Google's schedule, not this repository's, and a
+// retired name fails every plan with CodeModelNotFound. It has happened:
+// gemini-2.0-flash is no longer served, and gemini-2.5-flash is refused to new
+// users although models.list still lists it — checked on 2026-09-13, when this
+// default moved. models.list is therefore no evidence either way; a
+// generateContent call is. config.Load carries the same default.
+const DefaultModel = "gemini-3.6-flash"
 
 // Config is what the client needs. APIKey is the only required field.
 type Config struct {
