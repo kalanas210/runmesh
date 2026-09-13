@@ -171,6 +171,23 @@ func BuildJob(cfg Config, in tools.Input, owner string) (*batchv1.Job, error) {
 					// somebody named badly.
 					EnableServiceLinks: ptrTo(false),
 
+					// Spread one job's steps across nodes where the scheduler
+					// can. Losing a node then costs a job one of its parallel
+					// steps rather than all of them, and the retry of that step
+					// has another node to go to. ScheduleAnyway, not
+					// DoNotSchedule: a hard constraint strands steps in Pending
+					// on a cluster with one schedulable node, and a step that
+					// waits for a node that never comes times out for a reason
+					// that has nothing to do with its task.
+					TopologySpreadConstraints: []corev1.TopologySpreadConstraint{{
+						MaxSkew:           1,
+						TopologyKey:       corev1.LabelHostname,
+						WhenUnsatisfiable: corev1.ScheduleAnyway,
+						LabelSelector: &metav1.LabelSelector{
+							MatchLabels: map[string]string{LabelJobID: labelValue(in.JobID)},
+						},
+					}},
+
 					// Deleted the moment RunMesh decides the step is over, so
 					// a task does not get half a minute of a node it has been
 					// told to stop using.

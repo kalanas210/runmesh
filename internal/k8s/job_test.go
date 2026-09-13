@@ -196,6 +196,33 @@ func TestBuildJobDeniesTheAPIServerToTasks(t *testing.T) {
 	}
 }
 
+// TestBuildJobSpreadsAJobsStepsAcrossNodes: a job's parallel steps should not
+// all share one node's fate, and a soft constraint is the only safe kind. A hard
+// one strands steps in Pending on a cluster with a single schedulable node.
+func TestBuildJobSpreadsAJobsStepsAcrossNodes(t *testing.T) {
+	t.Parallel()
+
+	job, err := BuildJob(testConfig(), testInput(), "owner")
+	if err != nil {
+		t.Fatalf("BuildJob: %v", err)
+	}
+	spread := job.Spec.Template.Spec.TopologySpreadConstraints
+	if len(spread) != 1 {
+		t.Fatalf("%d topology spread constraints, want 1", len(spread))
+	}
+	c := spread[0]
+	if c.TopologyKey != corev1.LabelHostname || c.MaxSkew != 1 {
+		t.Errorf("spread over %q with skew %d, want %q with skew 1", c.TopologyKey, c.MaxSkew, corev1.LabelHostname)
+	}
+	if c.WhenUnsatisfiable != corev1.ScheduleAnyway {
+		t.Errorf("whenUnsatisfiable = %s, want ScheduleAnyway", c.WhenUnsatisfiable)
+	}
+	want := job.Spec.Template.Labels[LabelJobID]
+	if c.LabelSelector == nil || want == "" || c.LabelSelector.MatchLabels[LabelJobID] != want {
+		t.Errorf("selector = %+v, want the %s label the pod template carries (%q)", c.LabelSelector, LabelJobID, want)
+	}
+}
+
 // TestBuildJobSetsRequestsEqualToLimits: bursting makes a step that takes
 // 200ms idle and 3s under load, which produces a waterfall nobody can read and
 // a retry budget that depends on what else the cluster is doing.

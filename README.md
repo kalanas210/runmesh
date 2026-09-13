@@ -84,6 +84,7 @@ goal ──▶ planner ──▶ validated plan ──▶ RunMesh ──▶ isol
 - **Leases with fencing tokens.** Every write names the lease it holds, so a worker that has lost its lease can never record a result.
 - **Crash recovery is tested, not claimed.** A test kills a real server process mid-step, and another server finishes the job.
 - **Workload loss is retried.** A pod that is deleted, evicted or preempted gets a fresh attempt (`workload_lost`), while a task that genuinely failed stays failed.
+- **Node failure is tested on real nodes.** On a three-node kind cluster, a drained node's step is evicted, classified `workload_lost` and retried on the other worker, and a job's parallel steps are spread across nodes so one node's loss costs one step, not all of them.
 - **Graceful drain.** On shutdown, running steps get time to finish; anything still running goes back to the queue without spending retry budget.
 - **Admission control.** Past `RUNMESH_MAX_QUEUE_DEPTH`, submissions get `429` instead of joining a queue that will never drain.
 
@@ -437,7 +438,7 @@ environment variable, validated at boot and documented in
 | Store conformance | The in-memory and PostgreSQL stores pass the same cases, including 32 concurrent claimers that must never share a step | 36 cases × both stores |
 | Crash recovery | A real server process is killed mid-step, and another server finishes the job | real PostgreSQL |
 | Failure scenarios | An orphaned lease is recovered, lease expiry spends retry budget, a cancel reaches every dependent, a full queue answers `429` | 4 scenarios × both stores |
-| Kubernetes integration | A step runs in a real pod, a real failure is classified with its exit code and log tail, cancellation deletes the workload, a deleted pod is retried, and the RBAC Role refuses what it should | 6 tests on kind |
+| Kubernetes integration | A step runs in a real pod, a real failure is classified with its exit code and log tail, cancellation deletes the workload, a deleted pod is retried, a job's parallel steps land on different nodes, a drained node's step runs elsewhere, and the RBAC Role refuses what it should | 8 tests on a three-node kind cluster |
 | NetworkPolicy probes | Denied pods reach nothing; allowed pods reach the internet but not the cluster API | 4 live probes |
 | Dashboard | Waterfall geometry, the event feed, stream parsing, the proxy's origin guard | 280 tests (Vitest) |
 | Load | Smoke, sustained submissions, mixed reads and writes, and a soak; thresholds fail the run | 4 k6 scripts |
@@ -546,12 +547,11 @@ The choices with real alternatives are written down as ADRs in
 ## Roadmap
 
 Done: the runtime, durable state, Kubernetes isolation, the Gemini planner,
-observability, the dashboard, recovery from crashes and lost workloads, failure details from task containers, and readable reports.
+observability, the dashboard, recovery from crashes and lost workloads, failure details from task containers, readable reports, and a multi-node test cluster.
 Next:
 
 - [ ] **Adaptive concurrency.** Size the worker pool from observed latency and errors, instead of a fixed `RUNMESH_WORKERS`.
 - [ ] **Rate limiting.** Redis-backed limits per tool and per external host, shared across replicas.
-- [ ] **Multi-node cluster.** A kind cluster with worker nodes, pod spreading, and node drain and eviction tests.
 - [ ] **Cloud deployment.** Manifests for running RunMesh itself on managed Kubernetes with managed PostgreSQL.
 
 ---

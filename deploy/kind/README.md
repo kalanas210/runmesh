@@ -4,8 +4,10 @@
 kind create cluster --config deploy/kind/cluster.yaml
 kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.28.2/manifests/calico.yaml
 kubectl wait --for=condition=Ready node --all --timeout=300s
+kubectl get nodes    # runmesh-control-plane, runmesh-worker, runmesh-worker2
 
-kubectl apply -f deploy/kubernetes/
+kubectl apply -f deploy/kubernetes/00-namespaces.yaml -f deploy/kubernetes/10-rbac.yaml \
+  -f deploy/kubernetes/20-networkpolicy.yaml
 
 docker build -f deploy/docker/task.Dockerfile   -t runmesh/task:dev   .
 docker build -f deploy/docker/python.Dockerfile -t runmesh/python:dev .
@@ -14,18 +16,36 @@ kind load docker-image runmesh/task:dev runmesh/python:dev --name runmesh
 ./deploy/kind/verify-networkpolicy.sh
 ```
 
-That last line is not optional. See below.
+That last line is not optional. See below. `30-monitoring.yaml` is left out on
+purpose: it declares a ServiceMonitor, a kind that only exists on a cluster
+running the Prometheus Operator, and applying it anywhere else is an error.
 
 The Calico manifest is referenced by pinned tag rather than vendored: it is a
 quarter of a megabyte of generated YAML that nothing in this repository edits,
 and a pinned URL is reproducible without putting it in every `git log -p`.
 
-## Why the node comes up NotReady
+## Why the nodes come up NotReady
 
 `deploy/kind/cluster.yaml` sets `disableDefaultCNI: true`, so there is no
-networking until Calico is applied. A `NotReady` node between those two commands
-is the expected state, not a failure — and `kind create cluster --wait` will
+networking until Calico is applied. `NotReady` nodes between those two commands
+are the expected state, not a failure — and `kind create cluster --wait` will
 time out there, which is a confusing way to learn it.
+
+## Three nodes, and why
+
+The cluster is one control plane and two workers. With workers present, kind
+keeps the control-plane taint, so task pods run on the workers, as they would on
+a real cluster.
+
+The second worker is what makes node failure testable. Draining a node evicts
+the step running on it; the executor reads the eviction off the pod
+(`DisruptionTarget`) and classifies it as a retryable `workload_lost`; and the
+next attempt has another node to run on. On a single node, that next attempt
+has nowhere to go.
+
+The steps of one job are spread across the workers where the scheduler can (a
+soft topology spread on `runmesh.io/job-id`), so losing a node costs a job one
+of its parallel steps rather than all of them.
 
 The reason for disabling it is in the cluster config: kind's default CNI
 (kindnet) **does not enforce NetworkPolicy**. Policies apply without error,

@@ -32,8 +32,15 @@ networking:
   podSubnet: "192.168.0.0/16"
 
 nodes:
-  # A single node, which on kind is schedulable: the control-plane taint is
-  # removed for you. Multi-node makes scheduling more realistic and costs a
-  # second container's worth of memory; add `- role: worker` when there is
-  # something to learn from it.
+  # One control plane and two workers. With workers present, kind keeps the
+  # control-plane taint, so task pods land on the workers the way they would on
+  # a real cluster, and there is always a second node for a pod to move to.
+  #
+  # That second node is the point. A step whose node is drained is evicted, the
+  # executor classifies the eviction as workload_lost, and the next attempt has
+  # to run somewhere else. On one node "somewhere else" does not exist, and the
+  # eviction path could only ever be tested by deleting pods by hand. Each
+  # worker costs one more node container's worth of memory.
   - role: control-plane
+  - role: worker
+  - role: worker
