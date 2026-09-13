@@ -2,7 +2,6 @@ package httpapi
 
 import (
 	"context"
-	"crypto/subtle"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -286,10 +285,12 @@ func BodyLimit(max int64) middleware {
 
 // Auth accepts `Authorization: Bearer <key>`.
 //
-// The lookup key is a sha256 digest, so the map lookup itself carries no
-// timing information about how many leading bytes of a guessed KEY matched —
-// the property a naive string comparison lacks. The constant-time compare
-// afterwards guards the digest itself.
+// The lookup key is a sha256 digest, so the map lookup carries no timing
+// information about how many leading bytes of a guessed KEY matched — the
+// property a naive string comparison lacks. How many leading bytes of the
+// DIGEST matched is not something a guesser can steer, so nothing follows the
+// lookup: a constant-time compare here could only compare the digest with
+// itself.
 //
 // health and ready are exempt: a load balancer must be able to probe a service
 // without holding a credential.
@@ -305,14 +306,8 @@ func Auth(keys map[[32]byte]config.APIKey, log *slog.Logger, exempt func(*http.R
 				writeError(w, r, log, errUnauthenticated)
 				return
 			}
-			digest := config.KeyDigest(presented)
-			key, found := keys[digest]
+			key, found := keys[config.KeyDigest(presented)]
 			if !found {
-				writeError(w, r, log, errUnauthenticated)
-				return
-			}
-			want := config.KeyDigest(presented)
-			if subtle.ConstantTimeCompare(digest[:], want[:]) != 1 {
 				writeError(w, r, log, errUnauthenticated)
 				return
 			}
