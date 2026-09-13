@@ -32,6 +32,11 @@ Thumbs.db
 node_modules/
 .next/
 out/
+# TypeScript incremental build state, and the type shim next build regenerates
+# on every run: it imports route types from .next/, which is ignored, so a
+# committed copy would not resolve on a clean checkout.
+*.tsbuildinfo
+next-env.d.ts
 
 # Local assistant / editor state — machine-local, never committed
 .claude/

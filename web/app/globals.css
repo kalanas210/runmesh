@@ -1,0 +1,466 @@
+@import "tailwindcss";
+
+/* ----------------------------------------------------------------------------
+   RunMesh design tokens
+
+   A sibling of ApexTick, not a re-skin of it. The canvas, the bone ink, the
+   hairline construction, the type families and the easing curve are lifted
+   token for token, because a second product from the same house should feel
+   like the same hand drew it. Two things are ours: the accent, and an
+   eight-value semantic state palette.
+
+   The accent was chosen LAST and by elimination. Colour is data on this
+   dashboard, so the state palette was fixed first and the accent took the hue
+   arc that no status had claimed. RUNNING was deliberately moved out of hue
+   space altogether — a running step is bone-white, the brightest pixel on the
+   canvas — which freed 190deg-230deg for an accent that no state will ever be
+   confused with. Arc blue #3aa0ff sits 134deg from ApexTick's lime, 53deg from
+   the nearest chromatic state, and near-achromatic against all four neutrals.
+
+   The house rule this file exists to enforce: the accent is interactive chrome
+   and NOTHING else. It is never a state, never a bar fill, never a success.
+---------------------------------------------------------------------------- */
+
+:root {
+  /* Canvas + ink — unchanged from ApexTick. */
+  --ink: #0b0b0c;
+  --ink-2: #101012;
+  --ink-3: #17171a;
+  --ink-4: #1f1f23;
+
+  /* Off-white + text — unchanged from ApexTick. */
+  --bone: #f4f2ec;
+  --bone-2: #e7e4da;
+  --muted: #9a958a;
+  --faint: #8a857b;
+
+  /* Hairlines. Alpha-over-bone, never an opaque grey: the design expects the
+     pixels underneath to show through, which is what keeps a border legible
+     when it crosses a tinted lane or a filled bar. */
+  --line: rgba(244, 242, 236, 0.1);
+  --line-2: rgba(244, 242, 236, 0.18);
+  --line-strong: rgba(244, 242, 236, 0.32);
+
+  /* Signature accent: arc blue. 7.17:1 on --ink, which is AAA for body text,
+     and the same 7.17:1 for --accent-ink on a filled button — so ApexTick's
+     Button primary variant and the skip link transplant without a change. */
+  --accent: #3aa0ff;
+  --accent-ink: #0b0b0c;
+  --accent-soft: rgba(58, 160, 255, 0.16);
+  --accent-line: rgba(58, 160, 255, 0.45);
+
+  /* ------------------------------------------------------------------------
+     The semantic state palette. These eight values are FIXED.
+
+     They were ordered by relative luminance and given a mutual contrast of at
+     least 1.4:1 between each adjacent pair, because under deuteranopia and
+     protanopia amber, green and red all collapse into the same yellow-olive
+     region and are separable by luminance alone. That is why SUCCEEDED is a
+     light mint rather than a mid forest green and why RETRYING is a deep ember
+     rather than a bright gold: the obvious choices for both sat within 1.1:1
+     of each other and would have been indistinguishable to roughly one man in
+     twelve. TIMED_OUT is orchid precisely because magenta survives red-green
+     CVD — a deuteranope reads it as pale blue-grey while FAILED reads as dark
+     olive, a bigger perceived gap than any second red could have bought.
+
+     Do not "tidy" these toward a prettier ramp. The ratios are the point.
+
+     The one accepted compromise: QUEUED (6.60:1) and FAILED (6.50:1) sit at
+     effectively the same luminance and are identical under full achromatopsia.
+     They are separated by chroma for every other vision type and by TREATMENT
+     for all of them — QUEUED is a dotted hollow pill with a hollow ring glyph
+     and a dotted waterfall baseline, FAILED is a solid-stroked pill with a
+     cross and a hard 2px cap. Uniforming the pill strokes would erase that and
+     is the single easiest way to break this palette.
+  ------------------------------------------------------------------------ */
+  --st-queued: #9a958a; /* 6.60:1  */
+  --st-scheduled: #c9c5bb; /* 11.42:1 */
+  --st-running: #f4f2ec; /* 17.57:1 */
+  --st-retrying: #eda23a; /* 9.21:1  */
+  --st-succeeded: #5cefae; /* 13.36:1 */
+  --st-failed: #ff5c5c; /* 6.50:1  */
+  --st-timedout: #e48ada; /* 8.38:1  */
+  --st-cancelled: #7e8288; /* 5.09:1  */
+
+  /* Paired 16%-alpha interiors. A waterfall bar is a 1px stroke in the state
+     colour over one of these, so a dense run of bars reads as texture rather
+     than as eight competing blocks of flat colour. */
+  --st-queued-fill: rgba(154, 149, 138, 0.16);
+  --st-scheduled-fill: rgba(201, 197, 187, 0.16);
+  --st-running-fill: rgba(244, 242, 236, 0.16);
+  --st-retrying-fill: rgba(237, 162, 58, 0.16);
+  --st-succeeded-fill: rgba(92, 239, 174, 0.16);
+  --st-failed-fill: rgba(255, 92, 92, 0.16);
+  --st-timedout-fill: rgba(228, 138, 218, 0.16);
+  --st-cancelled-fill: rgba(126, 130, 136, 0.16);
+
+  /* The active tint, overridden per subtree via an inline style cast as
+     CSSProperties. ApexTick tints by event; we tint the selected lane. */
+  --tint: var(--accent);
+
+  /* Wider than ApexTick's 1480, because the waterfall needs the horizontal
+     room and an operator console has no margin to protect. */
+  --shell: 1600px;
+
+  /* Waterfall geometry. Declared here rather than in the chart so the lane
+     gutter and the sr-only table can agree without importing each other. */
+  --lane-h: 28px;
+  --lane-gap: 6px;
+  --lane-gutter: 264px;
+  --axis-h: 32px;
+  --brush-h: 34px;
+  --bar-min: 3px;
+
+  /* Motion. Three durations, because motion here signals a state change and
+     nothing else — there is no scroll theatre on this product. */
+  --dur-state: 220ms;
+  --dur-hover: 140ms;
+  --dur-panel: 420ms;
+}
+
+/* Tailwind v4 is CSS-first: this block, and only this block, is what turns a
+   custom property into a utility. A token declared in :root but missing here
+   compiles to NOTHING — no build error, no console warning, just an unstyled
+   element. Every colour above therefore has an entry below, fills included,
+   so the next agent cannot discover at render time that `bg-st-failed-fill`
+   silently does not exist. */
+@theme inline {
+  --color-ink: var(--ink);
+  --color-ink-2: var(--ink-2);
+  --color-ink-3: var(--ink-3);
+  --color-ink-4: var(--ink-4);
+  --color-bone: var(--bone);
+  --color-bone-2: var(--bone-2);
+  --color-muted: var(--muted);
+  --color-faint: var(--faint);
+  --color-line: var(--line);
+  --color-line-2: var(--line-2);
+  --color-line-strong: var(--line-strong);
+  --color-accent: var(--accent);
+  --color-accent-ink: var(--accent-ink);
+  --color-accent-soft: var(--accent-soft);
+  --color-accent-line: var(--accent-line);
+  --color-tint: var(--tint);
+
+  --color-st-queued: var(--st-queued);
+  --color-st-scheduled: var(--st-scheduled);
+  --color-st-running: var(--st-running);
+  --color-st-retrying: var(--st-retrying);
+  --color-st-succeeded: var(--st-succeeded);
+  --color-st-failed: var(--st-failed);
+  --color-st-timedout: var(--st-timedout);
+  --color-st-cancelled: var(--st-cancelled);
+
+  --color-st-queued-fill: var(--st-queued-fill);
+  --color-st-scheduled-fill: var(--st-scheduled-fill);
+  --color-st-running-fill: var(--st-running-fill);
+  --color-st-retrying-fill: var(--st-retrying-fill);
+  --color-st-succeeded-fill: var(--st-succeeded-fill);
+  --color-st-failed-fill: var(--st-failed-fill);
+  --color-st-timedout-fill: var(--st-timedout-fill);
+  --color-st-cancelled-fill: var(--st-cancelled-fill);
+
+  --font-display: var(--font-bricolage), "Inter Tight", ui-sans-serif, system-ui,
+    sans-serif;
+  --font-body: var(--font-inter-tight), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, "SFMono-Regular", monospace;
+
+  --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@layer base {
+  /* Writing `border` with no colour is already correct everywhere. Reaching
+     for an explicit grey defeats the token and looks wrong beside the rest. */
+  * {
+    border-color: var(--line);
+  }
+
+  html {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+    /* ApexTick smooth-scrolls. An operations console never should: a jump to
+       a failed step must land immediately, and a sticky time axis fights any
+       animated scroll. */
+    scroll-behavior: auto;
+  }
+
+  body {
+    background: var(--ink);
+    color: var(--bone);
+    font-family: var(--font-body);
+    font-feature-settings: "ss01", "cv01";
+    overflow-x: hidden;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4 {
+    font-family: var(--font-display);
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    text-wrap: balance;
+  }
+
+  ::selection {
+    background: var(--accent);
+    color: var(--accent-ink);
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 3px;
+    border-radius: 2px;
+  }
+
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: var(--ink);
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--ink-4);
+    border-radius: 999px;
+    border: 2px solid var(--ink);
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: #2c2c31;
+  }
+}
+
+@layer components {
+  .shell {
+    width: 100%;
+    max-width: var(--shell);
+    margin-inline: auto;
+    padding-inline: clamp(1.25rem, 5vw, 4rem);
+  }
+
+  /* Eyebrow / kicker label */
+  .kicker {
+    font-family: var(--font-mono);
+    font-size: 0.6875rem;
+    letter-spacing: 0.28em;
+    text-transform: uppercase;
+    font-weight: 500;
+    color: var(--muted);
+  }
+
+  /* Tabular figures. Every timestamp, duration, sequence number and attempt
+     count on this product wears this, so a column of numbers does not jitter
+     as it ticks. */
+  .tnum {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum";
+  }
+
+  .display {
+    font-family: var(--font-display);
+    font-weight: 600;
+    letter-spacing: -0.035em;
+    line-height: 0.92;
+    text-wrap: balance;
+  }
+
+  .hairline {
+    border-top: 1px solid var(--line);
+  }
+
+  /* Thin animated underline used on inline links and table row links. */
+  .ulink {
+    position: relative;
+    white-space: nowrap;
+  }
+  .ulink::after {
+    content: "";
+    position: absolute;
+    left: 0;
+    bottom: -2px;
+    height: 1px;
+    width: 100%;
+    background: currentColor;
+    transform: scaleX(0);
+    transform-origin: right;
+    transition: transform 0.45s var(--ease-out-expo);
+  }
+  .ulink:hover::after {
+    transform: scaleX(1);
+    transform-origin: left;
+  }
+}
+
+@layer utilities {
+  .text-tint {
+    color: var(--tint);
+  }
+  .bg-tint {
+    background-color: var(--tint);
+  }
+  .border-tint {
+    border-color: var(--tint);
+  }
+
+  .mask-fade-r {
+    -webkit-mask-image: linear-gradient(
+      to right,
+      transparent,
+      #000 8%,
+      #000 92%,
+      transparent
+    );
+    mask-image: linear-gradient(
+      to right,
+      transparent,
+      #000 8%,
+      #000 92%,
+      transparent
+    );
+  }
+
+  /* The three waterfall textures. They exist so that no segment is carried by
+     hue alone: hatch is "claimed but not started", dotline is "queued", and a
+     solid bar is "actually executing". An achromatope reads the chart from
+     these three and the bar's position, without any colour at all. */
+  .hatch {
+    background-image: repeating-linear-gradient(
+      45deg,
+      var(--hatch, var(--line-2)) 0 1px,
+      transparent 1px 5px
+    );
+  }
+
+  .dotline {
+    background-image: repeating-linear-gradient(
+      to right,
+      var(--hatch, var(--line-2)) 0 2px,
+      transparent 2px 6px
+    );
+  }
+
+  /* Vertical time gridlines behind the lane body. --grid-step is set per
+     render from the scale's chosen tick spacing. */
+  .lane-grid {
+    background-image: repeating-linear-gradient(
+      to right,
+      var(--line) 0 1px,
+      transparent 1px var(--grid-step, 120px)
+    );
+  }
+}
+
+/* ----------------------------------------------------------------------------
+   Motion. Three keyframes, and deliberately no fourth.
+
+   ApexTick's entire scroll vocabulary — Lenis, ScrollProgress, Reveal, Stagger,
+   Magnetic, Marquee — is absent by choice. A blur-and-lift entrance on a table
+   of running jobs makes the state change unreadable, and Lenis hijacks
+   document-wide wheel events, which would fight the waterfall's own horizontal
+   scroll region and its sticky axis. What survives is the easing token and
+   three animations that each signal a state change.
+---------------------------------------------------------------------------- */
+
+/* The RUNNING dot's halo. 2s infinite. */
+@keyframes rm-pulse {
+  0% {
+    transform: scale(1);
+    opacity: 0.55;
+  }
+  70%,
+  100% {
+    transform: scale(2.4);
+    opacity: 0;
+  }
+}
+
+/* A 1px bone edge sliding along the open right end of an in-flight bar, so
+   "still running" is visible without reading the clock. 1.6s linear infinite. */
+@keyframes rm-shimmer {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+
+/* A 400ms accent left-rail on a row that just received an event. */
+@keyframes rm-flash {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+
+/* The waterfall's new-event cue: a 2px accent rail on a lane row that just
+   received an event, faded out over 400ms.
+
+   It is driven by a `data-flash` attribute written straight onto the row
+   element rather than by React state, because a transient cue that nothing
+   renders from should not cost a re-render of every lane on the chart. The rail
+   is always in the DOM and invisible; the attribute is what animates it.
+
+   Under prefers-reduced-motion the block at the end of this file kills the
+   animation and gives the row an inset accent rule instead, so the cue survives
+   as something static rather than vanishing entirely. */
+.lane-flash {
+  position: absolute;
+  inset-block: 0;
+  left: 0;
+  z-index: 20;
+  width: 2px;
+  background: var(--accent);
+  opacity: 0;
+  pointer-events: none;
+}
+[data-flash] > .lane-flash {
+  animation: rm-flash 400ms var(--ease-out-expo) forwards;
+}
+
+/* Keyboard skip link: parked above the viewport and slid in, not display:none,
+   so it stays focusable. */
+.skip-link {
+  position: fixed;
+  left: 1rem;
+  top: -5rem;
+  z-index: 70;
+  opacity: 0;
+  transition:
+    top 0.25s ease,
+    opacity 0.25s ease;
+}
+.skip-link:focus {
+  top: 1rem;
+  opacity: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+  [data-pulse],
+  [data-shimmer] {
+    animation: none !important;
+  }
+
+  /* The new-event flash must not simply vanish under reduced motion: it is a
+     cue, not a decoration, and an operator who has switched animation off
+     still needs to see which row just moved. RowFlash holds data-flash for 4s;
+     here that renders as a static accent rail instead of a fade. */
+  [data-flash] {
+    animation: none !important;
+    box-shadow: inset 2px 0 0 var(--accent);
+  }
+}
