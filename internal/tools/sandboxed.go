@@ -120,8 +120,15 @@ func HTTPRequest(image string) Container {
 		Descriptor: Descriptor{
 			Name:    "http_request",
 			Version: "1.0",
-			Description: "Fetches one HTTP(S) URL from the sandbox and returns its status, " +
-				"headers and body. Only public addresses are reachable.",
+			// The result's shape is spelled out because a descriptor is all the
+			// planner is told about a tool (see planner.FunctionDeclarations):
+			// the step that analyses a response has to read it out of deps, and
+			// without field names the model can only guess where it is.
+			Description: "Fetches one HTTP(S) URL from the sandbox. Only public addresses are " +
+				"reachable. Returns an object: url (after redirects), status, headers, " +
+				"content_type, truncated, body_bytes, and the response text in body - or " +
+				"in body_base64 when it is not valid UTF-8. A dependent step reads the " +
+				"text as deps[\"<this step's id>\"][\"body\"].",
 			InputSchema: json.RawMessage(`{
   "type": "object",
   "required": ["url"],
