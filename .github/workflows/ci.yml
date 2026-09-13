@@ -45,9 +45,16 @@ jobs:
           go-version: '1.26'
           cache: true
 
+      # gofmt and the `./...` pattern are both pointed at the directories this
+      # repository owns rather than at the whole tree. On a CI runner web/ has
+      # no node_modules — `npm ci` happens in the `web` job on a different
+      # machine — so nothing here would descend into one today. It is spelled
+      # this way to match the Makefile, and so that the day somebody adds a
+      # Node step to this job is not the day the Go suite starts compiling
+      # somebody else's vendored Go source.
       - name: Verify formatting
         run: |
-          unformatted=$(gofmt -l .)
+          unformatted=$(gofmt -l cmd internal migrations tests)
           if [ -n "$unformatted" ]; then
             echo "These files are not gofmt'd:"
             echo "$unformatted"
@@ -55,7 +62,7 @@ jobs:
           fi
 
       - name: go vet
-        run: go vet ./...
+        run: go vet ./cmd/... ./internal/... ./migrations/... ./tests/...
 
       - name: Verify go.mod is tidy
         run: |
@@ -63,13 +70,40 @@ jobs:
           git diff --exit-code go.mod go.sum
 
       - name: Build
-        run: go build ./...
+        run: go build ./cmd/... ./internal/... ./migrations/... ./tests/...
 
       - name: Test with race detector
-        run: go test -race -count=1 -covermode=atomic -coverprofile=coverage.out ./...
+        run: go test -race -count=1 -covermode=atomic -coverprofile=coverage.out ./cmd/... ./internal/... ./migrations/... ./tests/...
 
       - name: Coverage summary
         run: go tool cover -func=coverage.out | tail -n 1
+
+      # The integration suite is behind the `integration` build tag, so the run
+      # above did not touch it. It drives the assembled server against a real
+      # database, and it reuses the service container this job already has —
+      # RUNMESH_TEST_DATABASE_URL is set at the job level and reaches this step
+      # unchanged. A separate job would have had to replicate the whole
+      # `services:` block, and a job that runs Go tests without that variable
+      # trips TestDatabaseIsConfiguredInCI, which exists to make exactly that
+      # mistake loud.
+      #
+      # No -race here. The race detector is already satisfied by the step above
+      # on the same code; paying for it a second time on the slowest suite in
+      # the repository buys a second look at the same packages.
+      - name: Integration tests
+        run: go test -count=1 -tags=integration ./tests/integration/...
+
+      # Benchmarks, run ONCE each rather than measured. -benchtime 1x means
+      # every b.N loop executes a single iteration, so this step proves the
+      # benchmarks still compile and still run to completion without a panic —
+      # and does not pretend that a number produced on a shared, throttled,
+      # noisy-neighbour CI runner means anything. Timings that regress are
+      # found with `make bench` on hardware somebody controls.
+      #
+      # It runs against the same PostgreSQL service, because a benchmark that
+      # opens the store would otherwise skip and report success.
+      - name: Benchmarks (compile and run once)
+        run: go test -run '^$' -bench . -benchtime 1x -benchmem ./cmd/... ./internal/... ./migrations/... ./tests/...
 
   staticcheck:
     name: staticcheck
@@ -82,3 +116,53 @@ jobs:
           cache: true
       - run: go install honnef.co/go/tools/cmd/staticcheck@latest
       - run: staticcheck ./...
+
+  # The Next.js dashboard. An independent job with no `needs:`, exactly like
+  # staticcheck: it shares no toolchain with the Go build, it fails for
+  # unrelated reasons, and reading which of the two went red should not require
+  # opening either.
+  #
+  # It deliberately runs NO Go tests. A job that did would inherit GitHub's
+  # automatic CI=true without this workflow's RUNMESH_TEST_DATABASE_URL, and
+  # TestDatabaseIsConfiguredInCI would fail it — correctly, since a store
+  # nobody ran reporting green is the thing that test exists to prevent.
+  web:
+    name: web (lint / build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          # setup-node's npm cache hard-fails when it cannot find a lockfile at
+          # this path, and the path is relative to the repository root rather
+          # than to `defaults.run.working-directory` — which applies to `run`
+          # steps only and not to an action's inputs.
+          cache-dependency-path: web/package-lock.json
+
+      # `ci`, not `install`: it installs exactly what package-lock.json pins and
+      # fails if the lockfile and package.json disagree, which is the property
+      # that makes a CI build reproducible rather than merely repeated.
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      # The waterfall's correctness lives in pure reducer modules — folding the
+      # event stream into per-attempt lanes, and the time scale that keeps a 3ms
+      # step and a 40-minute backoff legible in one viewport. Those are unit
+      # tested, and this is the step that holds them.
+      - name: Test
+        run: npm test
+
+      # Next's build is also the type check — `next build` runs tsc over the
+      # whole app — so this step gates both, and a separate tsc step would only
+      # do the same work twice.
+      - name: Build
+        run: npm run build
