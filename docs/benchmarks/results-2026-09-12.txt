@@ -1,0 +1,120 @@
+# RunMesh benchmark results — 2026-09-12
+#
+# Raw `go test -bench` output, committed so every table in README.md can be
+# checked against what the tool printed. Two invocations, for the reason that
+# file gives: the fixture-bound benchmarks pin b.N, the pure ones do not.
+#
+# Machine: 12th Gen Intel Core i7-12650H (10c/16t), 15.7 GB, Windows 11 26200,
+#          go1.26.0 windows/amd64, GOMAXPROCS=16.
+# Database: PostgreSQL 17.11 (postgres:17-alpine) in Docker Desktop on host port
+#           5434, started by docker-compose.yml with fsync=off and
+#           synchronous_commit=off.
+#
+# ── (1) ───────────────────────────────────────────────────────────────────────
+# RUNMESH_TEST_DATABASE_URL='postgres://runmesh:runmesh@127.0.0.1:5434/runmesh?sslmode=disable' \
+#   go test ./internal/bench -run '^$' \
+#     -bench 'BenchmarkScheduler|BenchmarkStoreOp|BenchmarkClaimUnderContention' \
+#     -benchmem -benchtime=2000x -timeout=40m
+
+goos: windows
+goarch: amd64
+pkg: github.com/kalanas210/runmesh/internal/bench
+cpu: 12th Gen Intel(R) Core(TM) i7-12650H
+BenchmarkScheduler/store=mem/workers=1-16         	    2000	    272062 ns/op	    272062 ns/step	      3676 steps/sec	   53432 B/op	      64 allocs/op
+BenchmarkScheduler/store=mem/workers=2-16         	    2000	    282518 ns/op	    282518 ns/step	      3540 steps/sec	   51810 B/op	      63 allocs/op
+BenchmarkScheduler/store=mem/workers=4-16         	    2000	    221721 ns/op	    221721 ns/step	      4510 steps/sec	   44817 B/op	      61 allocs/op
+BenchmarkScheduler/store=mem/workers=8-16         	    2000	    146634 ns/op	    146634 ns/step	      6820 steps/sec	   30890 B/op	      55 allocs/op
+BenchmarkScheduler/store=mem/workers=16-16        	    2000	    112482 ns/op	    112482 ns/step	      8890 steps/sec	   20945 B/op	      51 allocs/op
+BenchmarkScheduler/store=pg/workers=1-16          	    2000	  26950903 ns/op	  26950903 ns/step	        37.10 steps/sec	  144852 B/op	    3549 allocs/op
+BenchmarkScheduler/store=pg/workers=2-16          	    2000	   9993672 ns/op	   9993672 ns/step	       100.1 steps/sec	  144834 B/op	    3549 allocs/op
+BenchmarkScheduler/store=pg/workers=4-16          	    2000	   6461115 ns/op	   6461115 ns/step	       154.8 steps/sec	  136098 B/op	    3319 allocs/op
+BenchmarkScheduler/store=pg/workers=8-16          	    2000	   5360371 ns/op	   5360371 ns/step	       186.6 steps/sec	  122581 B/op	    2969 allocs/op
+BenchmarkScheduler/store=pg/workers=16-16         	    2000	   4240316 ns/op	   4240316 ns/step	       235.8 steps/sec	  115422 B/op	    2780 allocs/op
+BenchmarkStoreOp/store=mem/op=Ping-16             	    2000	        18.20 ns/op	  54945055 ops/sec	       0 B/op	       0 allocs/op
+BenchmarkStoreOp/store=mem/op=Claim-16            	    2000	    317868 ns/op	      3146 ops/sec	   51707 B/op	      21 allocs/op
+BenchmarkStoreOp/store=mem/op=Start-16            	    2000	       432.6 ns/op	   2311604 ops/sec	      24 B/op	       1 allocs/op
+BenchmarkStoreOp/store=mem/op=Heartbeat-16        	    2000	        74.85 ns/op	  13360053 ops/sec	       0 B/op	       0 allocs/op
+BenchmarkStoreOp/store=mem/op=Finish-16           	    2000	       646.2 ns/op	   1547389 ops/sec	      40 B/op	       2 allocs/op
+BenchmarkStoreOp/store=pg/op=Ping-16              	    2000	    633203 ns/op	      1579 ops/sec	       0 B/op	       0 allocs/op
+BenchmarkStoreOp/store=pg/op=Claim-16             	    2000	   7717095 ns/op	       129.6 ops/sec	   45205 B/op	    1117 allocs/op
+BenchmarkStoreOp/store=pg/op=Start-16             	    2000	   5233530 ns/op	       191.1 ops/sec	   45862 B/op	    1199 allocs/op
+BenchmarkStoreOp/store=pg/op=Heartbeat-16         	    2000	   2745761 ns/op	       364.2 ops/sec	    2392 B/op	      56 allocs/op
+BenchmarkStoreOp/store=pg/op=Finish-16            	    2000	   5215780 ns/op	       191.7 ops/sec	   46788 B/op	    1239 allocs/op
+BenchmarkClaimUnderContention/store=mem/claimers=1-16         	    2000	     96921 ns/op	         4.000 leases/trip	     10318 ops/sec	   13568 B/op	       9 allocs/op
+BenchmarkClaimUnderContention/store=mem/claimers=2-16         	    2000	     87557 ns/op	         4.000 leases/trip	     11444 ops/sec	   13570 B/op	       9 allocs/op
+BenchmarkClaimUnderContention/store=mem/claimers=4-16         	    2000	     83847 ns/op	         4.000 leases/trip	     11998 ops/sec	   13576 B/op	       9 allocs/op
+BenchmarkClaimUnderContention/store=mem/claimers=8-16         	    2000	     82861 ns/op	         4.000 leases/trip	     12237 ops/sec	   13882 B/op	      10 allocs/op
+BenchmarkClaimUnderContention/store=mem/claimers=16-16        	    2000	     91832 ns/op	         4.000 leases/trip	     11216 ops/sec	   14240 B/op	      10 allocs/op
+BenchmarkClaimUnderContention/store=mem/claimers=32-16        	    2000	    100117 ns/op	         4.000 leases/trip	     10608 ops/sec	   15162 B/op	      10 allocs/op
+BenchmarkClaimUnderContention/store=pg/claimers=1-16          	    2000	   3698292 ns/op	         4.000 leases/trip	       270.4 ops/sec	   15616 B/op	     350 allocs/op
+BenchmarkClaimUnderContention/store=pg/claimers=2-16          	    2000	   3552286 ns/op	         3.992 leases/trip	       281.5 ops/sec	   15717 B/op	     351 allocs/op
+BenchmarkClaimUnderContention/store=pg/claimers=4-16          	    2000	   3603850 ns/op	         3.976 leases/trip	       277.5 ops/sec	   15911 B/op	     354 allocs/op
+BenchmarkClaimUnderContention/store=pg/claimers=8-16          	    2000	   2476094 ns/op	         3.935 leases/trip	       404.5 ops/sec	   16383 B/op	     361 allocs/op
+BenchmarkClaimUnderContention/store=pg/claimers=16-16         	    2000	   2557102 ns/op	         3.876 leases/trip	       391.1 ops/sec	   16935 B/op	     366 allocs/op
+BenchmarkClaimUnderContention/store=pg/claimers=32-16         	    2000	   2442656 ns/op	         3.759 leases/trip	       409.4 ops/sec	   18109 B/op	     378 allocs/op
+PASS
+ok  	github.com/kalanas210/runmesh/internal/bench	243.447s
+
+# ── (2) ───────────────────────────────────────────────────────────────────────
+# go test ./internal/bench -run '^$' \
+#   -bench 'BenchmarkPlanValidate|BenchmarkReadiness|BenchmarkBlockedBy|BenchmarkMetricsRender|BenchmarkObserver' \
+#   -benchmem
+
+goos: windows
+goarch: amd64
+pkg: github.com/kalanas210/runmesh/internal/bench
+cpu: 12th Gen Intel(R) Core(TM) i7-12650H
+BenchmarkPlanValidate/shape=chain/steps=10-16         	  191707	      5906 ns/op	    169313 ops/sec	    2179 B/op	      28 allocs/op
+BenchmarkPlanValidate/shape=chain/steps=100-16        	   22167	     58004 ns/op	     17240 ops/sec	   18187 B/op	     208 allocs/op
+BenchmarkPlanValidate/shape=fanin/steps=100-16        	   28496	     43032 ns/op	     23238 ops/sec	   17337 B/op	      77 allocs/op
+BenchmarkReadiness/shape=chain/steps=100-16           	   77324	     16368 ns/op	     61094 ops/sec	   6109354 steps/sec	       0 B/op	       0 allocs/op
+BenchmarkReadiness/shape=fanin/steps=100-16           	 1438266	       727.3 ns/op	   1374874 ops/sec	 137487400 steps/sec	       0 B/op	       0 allocs/op
+BenchmarkReadiness/shape=fanin/steps=100/deps=met-16  	  194878	      6678 ns/op	    149738 ops/sec	  14973760 steps/sec	       0 B/op	       0 allocs/op
+BenchmarkReadiness/shape=flat/steps=100-16            	 2293860	       526.2 ns/op	   1900532 ops/sec	 190053167 steps/sec	       0 B/op	       0 allocs/op
+BenchmarkBlockedBy-16                                 	  136968	      9248 ns/op	    108136 ops/sec	    1007 B/op	       5 allocs/op
+BenchmarkMetricsRender/state=cold-16                  	    6847	    169676 ns/op	 328.63 MB/s	     55761 bytes/scrape	      5894 ops/sec	      1577 series	  109024 B/op	    1172 allocs/op
+BenchmarkMetricsRender/state=warm-16                  	    9510	    167100 ns/op	 334.76 MB/s	     55939 bytes/scrape	      5984 ops/sec	      1577 series	  109104 B/op	    1174 allocs/op
+BenchmarkObserver/m=Claimed-16                        	17981918	        74.21 ns/op	  13475747 ops/sec	       0 B/op	       0 allocs/op
+BenchmarkObserver/m=Dispatched-16                     	69790569	        14.73 ns/op	  67894817 ops/sec	       0 B/op	       0 allocs/op
+BenchmarkObserver/m=AttemptStarted-16                 	23826163	        49.00 ns/op	  20407717 ops/sec	       0 B/op	       0 allocs/op
+BenchmarkObserver/m=ToolExecuted-16                   	24876652	        48.59 ns/op	  20578763 ops/sec	       0 B/op	       0 allocs/op
+BenchmarkObserver/m=AttemptSettled/ok-16              	11177388	       110.5 ns/op	   9049834 ops/sec	       0 B/op	       0 allocs/op
+BenchmarkObserver/m=AttemptSettled/failed-16          	 6702621	       165.0 ns/op	   6061184 ops/sec	       0 B/op	       0 allocs/op
+BenchmarkObserver/m=AttemptSettled/other-16           	 6903843	       170.2 ns/op	   5875267 ops/sec	       0 B/op	       0 allocs/op
+BenchmarkObserver/m=Heartbeat-16                      	20786347	        56.99 ns/op	  17546596 ops/sec	       0 B/op	       0 allocs/op
+BenchmarkObserver/m=StoreOperation-16                 	24185599	        51.04 ns/op	  19594200 ops/sec	       0 B/op	       0 allocs/op
+BenchmarkObserver/m=RequestFinished-16                	 7394671	       171.3 ns/op	   5837035 ops/sec	       0 B/op	       0 allocs/op
+BenchmarkObserverParallel-16                          	 8324343	       137.1 ns/op	   7293225 ops/sec	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/kalanas210/runmesh/internal/bench	29.676s
+
+# ---------------------------------------------------------------------------
+# (3) Re-measurement of BenchmarkMetricsRender only, same machine, later
+#     session, 2026-09-12.
+#
+#     Why it exists: go_cpu_gc_seconds_total was registered with CounterFunc
+#     (func() uint64) over /cpu/classes/gc/total:cpu-seconds, so every
+#     fractional CPU-second was floored away and the series rendered a flat 0.
+#     It is now a float-valued counter, which changes the bytes this benchmark
+#     reports, so the table in README.md had to be re-run rather than adjusted.
+#     The scrape also makes one allocation fewer: the sched-latency collector's
+#     per-scrape bucket slice became a fixed stack array when its deep copy of
+#     the runtime's histogram moved inside runtimeSource's mutex.
+#
+#     This is a DIFFERENT SESSION from (1) and (2), and on this laptop that
+#     moves ns/op by a third — which is why warm reads slower than cold here.
+#     Only the MetricsRender table in README.md is fed from this block; every
+#     other Go table there still comes from (2) above, because the fix does not
+#     touch what they measure.
+#
+# go test ./internal/bench -run '^$' -bench 'BenchmarkMetricsRender' -benchmem
+# ---------------------------------------------------------------------------
+
+goos: windows
+goarch: amd64
+pkg: github.com/kalanas210/runmesh/internal/bench
+cpu: 12th Gen Intel(R) Core(TM) i7-12650H
+BenchmarkMetricsRender/state=cold-16         	    9469	    134267 ns/op	 415.34 MB/s	     55767 bytes/scrape	      7448 ops/sec	      1577 series	  108961 B/op	    1171 allocs/op
+BenchmarkMetricsRender/state=warm-16         	   10000	    178487 ns/op	 313.45 MB/s	     55947 bytes/scrape	      5603 ops/sec	      1577 series	  109041 B/op	    1173 allocs/op
+PASS
+ok  	github.com/kalanas210/runmesh/internal/bench	3.996s
