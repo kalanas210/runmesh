@@ -1,8 +1,9 @@
 #!/usr/bin/env pwsh
 # RunMesh task runner for Windows (GNU make equivalent).
-#   ./task.ps1 build | run | test | test-pg | test-integration | race | cover
-#                 | bench | load | vet | fmt | lint | check | tidy | clean
-#                 | db-up | db-down | db-reset | monitoring-up | monitoring-down
+#   ./task.ps1 build | run | test | test-pg | test-redis | test-integration
+#                 | race | cover | bench | load | vet | fmt | lint | check
+#                 | tidy | clean | db-up | db-down | db-reset
+#                 | monitoring-up | monitoring-down | redis-up | redis-down
 #                 | web-install | web-dev | web-build | web-lint | web-test
 param([Parameter(Position = 0)][string]$Target = 'help')
 
@@ -34,6 +35,13 @@ if (-not $env:RUNMESH_PROMETHEUS_PORT) { $env:RUNMESH_PROMETHEUS_PORT = '9090' }
 if (-not $env:RUNMESH_GRAFANA_PORT) { $env:RUNMESH_GRAFANA_PORT = '3001' }
 $PromPort = $env:RUNMESH_PROMETHEUS_PORT
 $GrafanaPort = $env:RUNMESH_GRAFANA_PORT
+
+# The host port the local Redis is published on, overridable exactly like the
+# database port and for exactly the same reason:
+#
+#   $env:RUNMESH_REDIS_PORT = '6380'; ./task.ps1 test-redis
+if (-not $env:RUNMESH_REDIS_PORT) { $env:RUNMESH_REDIS_PORT = '6379' }
+$RedisPort = $env:RUNMESH_REDIS_PORT
 
 # The k6 script 'load' runs. Override it for a second scenario rather than
 # adding a second target that has to be kept in step with this one:
@@ -119,6 +127,15 @@ switch ($Target) {
         # "it was slow ten minutes ago" is still answerable.
         Invoke-Step 'monitoring-down' { docker compose --profile monitoring stop prometheus grafana }
     }
+    'redis-up' {
+        # Behind the `ratelimit` compose profile, so db-up and test-pg pull
+        # and wait for nothing new. Rate limiting is itself opt-in - see
+        # ADR 0015 - so its dependency costs nothing until asked for either.
+        Invoke-Step 'redis-up' { docker compose --profile ratelimit up -d --wait redis }
+    }
+    'redis-down' {
+        Invoke-Step 'redis-down' { docker compose --profile ratelimit stop redis }
+    }
     'test-pg' {
         # The PostgreSQL conformance suite and the crash-recovery test SKIP when
         # this is unset, so 'test' stays useful without a database. This target
@@ -127,6 +144,14 @@ switch ($Target) {
         Use-RaceToolchain
         $env:RUNMESH_TEST_DATABASE_URL = "postgres://runmesh:runmesh@127.0.0.1:$DbPort/runmesh?sslmode=disable"
         Invoke-Step 'test-pg' { go test -race -count=1 @Pkg }
+    }
+    'test-redis' {
+        # internal/redis and internal/ratelimit SKIP when this is unset, the
+        # same shape RUNMESH_TEST_DATABASE_URL gives the PostgreSQL suite.
+        & $PSCommandPath redis-up
+        Use-RaceToolchain
+        $env:RUNMESH_TEST_REDIS_URL = "redis://127.0.0.1:$RedisPort"
+        Invoke-Step 'test-redis' { go test -race -count=1 @Pkg }
     }
     'test-integration' {
         # The integration suite drives the assembled server rather than a
@@ -185,12 +210,15 @@ switch ($Target) {
         'test   run all tests',
         'race   run all tests under the race detector',
         'test-pg  the whole suite against the local PostgreSQL',
+        'test-redis  the whole suite against the local Redis',
         'test-integration  the integration suite against the local PostgreSQL',
         'db-up    start the local PostgreSQL',
         'db-down  stop it, keeping its data',
         'db-reset destroy it and its data',
         'monitoring-up    start prometheus + grafana and wait for them',
         'monitoring-down  stop them, keeping their data',
+        'redis-up    start the local Redis and wait for it',
+        'redis-down  stop it (no data to keep)',
         'cover  tests + HTML coverage report',
         'bench  run benchmarks',
         'load   run the k6 load script against a running server',

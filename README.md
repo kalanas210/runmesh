@@ -94,6 +94,7 @@ goal ──▶ planner ──▶ validated plan ──▶ RunMesh ──▶ isol
 - **Default-deny NetworkPolicy.** Only pods granted the network get DNS and egress, and never to private, loopback, link-local (cloud metadata) or CGNAT ranges. A script proves the policy is **enforced**, not just applied.
 - **SSRF guard** in the task binary: every connection, including each redirect hop, is refused unless the resolved address is public.
 - **Execution policy.** A tool *asks* for resources and network, and the operator *grants* them; tool allow and deny lists and image prefixes on top.
+- **Rate limiting.** Redis-backed token buckets, per tool and per external host, shared across every replica — checked by the engine before a Kubernetes Job is ever created, not inside the sandboxed task pod. Off by default; a deployment that never sets `RUNMESH_REDIS_URL` is unaffected.
 - **Scoped API keys** (`jobs.read`, `jobs.write`, `jobs.cancel`, `metrics.read`, `admin`), stored only as SHA-256 digests.
 
 ### Observability
@@ -236,6 +237,7 @@ Every row above is covered by an automated test.
 |---|---|
 | **Runtime** | Go 1.26: standard-library `net/http` and `log/slog`; the only direct dependencies are `pgx` and the Kubernetes client libraries |
 | **State and queue** | PostgreSQL 17: `FOR UPDATE SKIP LOCKED`, embedded migrations, an advisory lock for rolling deploys |
+| **Rate limiting** | Redis 7, spoken over a hand-written RESP2 client; a Lua token bucket via `EVAL`. Optional — off unless `RUNMESH_REDIS_URL` is set |
 | **Execution** | Kubernetes Jobs via `client-go`; kind + Calico locally; a distroless task image and a Python 3.13 sandbox image |
 | **Planning** | Google Gemini API (`gemini-3.6-flash` by default) with structured output, called over `net/http` without an SDK |
 | **API** | REST + Server-Sent Events, scoped API keys, idempotency keys |
@@ -245,12 +247,14 @@ Every row above is covered by an automated test.
 | **Delivery** | Multi-stage Docker builds onto distroless images, docker compose, GitHub Actions |
 
 **Dependencies are a feature.** There is no Prometheus client library, no
-WebSocket library and no Gemini SDK: each would have added a large surface for
-a small, well-specified protocol. The Kubernetes libraries stay inside
-`internal/k8s` (plus one resource-quantity type in `internal/policy`), and `pgx`
-is imported by exactly one production file. The reasoning is in
-[ADR 0007](docs/decisions/0007-one-dependency-the-postgres-driver.md) and
-[ADR 0012](docs/decisions/0012-metrics-without-a-client-library.md).
+WebSocket library, no Gemini SDK and no Redis client library: each would have
+added a large surface for a small, well-specified protocol. The Kubernetes
+libraries stay inside `internal/k8s` (plus one resource-quantity type in
+`internal/policy`), and `pgx` is imported by exactly one production file. The
+reasoning is in
+[ADR 0007](docs/decisions/0007-one-dependency-the-postgres-driver.md),
+[ADR 0012](docs/decisions/0012-metrics-without-a-client-library.md) and
+[ADR 0015](docs/decisions/0015-redis-rate-limiting-a-hand-written-resp-client.md).
 
 ---
 
@@ -360,6 +364,27 @@ scrapes `/api/v1/metrics` on port 8080 with a bearer token read from a file.
 The default file matches the `dev` key in [`.env.example`](.env.example); point
 `RUNMESH_SCRAPE_TOKEN_FILE` at your own key, ideally one that holds only
 `metrics.read`.
+
+### 6 · Rate limiting
+
+```bash
+make redis-up   # Redis on :6379
+```
+
+```bash
+export RUNMESH_REDIS_URL=redis://127.0.0.1:6379
+export RUNMESH_RATE_LIMIT_PER_TOOL_RATE=5      # tokens/s
+export RUNMESH_RATE_LIMIT_PER_TOOL_BURST=10
+export RUNMESH_RATE_LIMIT_PER_HOST_RATE=2
+export RUNMESH_RATE_LIMIT_PER_HOST_BURST=5
+go run ./cmd/server
+```
+
+A step whose tool or target host is over budget fails with `rate_limited`
+and the engine's ordinary retry ladder picks it back up once the bucket has
+a token — see [ADR 0015](docs/decisions/0015-redis-rate-limiting-a-hand-written-resp-client.md).
+Leave `RUNMESH_REDIS_URL` unset and every tool and every host runs unlimited,
+exactly as before this existed.
 
 ---
 
@@ -542,16 +567,16 @@ The choices with real alternatives are written down as ADRs in
 | [0012](docs/decisions/0012-metrics-without-a-client-library.md) | Metrics without a client library |
 | [0013](docs/decisions/0013-server-sent-events-not-websockets.md) | Server-Sent Events, not WebSockets |
 | [0014](docs/decisions/0014-worker-pool-size-is-adaptive.md) | The worker pool sizes itself between Workers and MaxWorkers |
+| [0015](docs/decisions/0015-redis-rate-limiting-a-hand-written-resp-client.md) | Rate limiting, on a hand-written RESP client |
 
 ---
 
 ## Roadmap
 
 Done: the runtime, durable state, Kubernetes isolation, the Gemini planner,
-observability, the dashboard, recovery from crashes and lost workloads, failure details from task containers, readable reports, a multi-node test cluster, and adaptive concurrency.
+observability, the dashboard, recovery from crashes and lost workloads, failure details from task containers, readable reports, a multi-node test cluster, adaptive concurrency, and Redis-backed rate limiting.
 Next:
 
-- [ ] **Rate limiting.** Redis-backed limits per tool and per external host, shared across replicas.
 - [ ] **Cloud deployment.** Manifests for running RunMesh itself on managed Kubernetes with managed PostgreSQL.
 
 ---

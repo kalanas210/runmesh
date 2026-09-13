@@ -25,6 +25,8 @@ import (
 	"github.com/kalanas210/runmesh/internal/pgstore"
 	"github.com/kalanas210/runmesh/internal/planner"
 	"github.com/kalanas210/runmesh/internal/policy"
+	"github.com/kalanas210/runmesh/internal/ratelimit"
+	"github.com/kalanas210/runmesh/internal/redis"
 	"github.com/kalanas210/runmesh/internal/runmesh"
 	"github.com/kalanas210/runmesh/internal/tools"
 )
@@ -266,6 +268,44 @@ func openStore(ctx context.Context, cfg config.Config, log *slog.Logger) (store,
 	return s, nil
 }
 
+// openRateLimiter builds the token-bucket rate limiter, or (nil, nil, nil)
+// when RUNMESH_REDIS_URL is empty. This is openStore's own shape, for the
+// same reason: RUNMESH_DATABASE_URL unset means the in-memory store, but SET
+// AND UNREACHABLE fails the boot rather than quietly starting non-durable —
+// an operator who configured a limiter and got a process that silently
+// limits nothing is owed a boot failure naming the variable, not a runtime
+// surprise the first time CodeRateLimitUnavailable shows up on a step.
+//
+// The returned *redis.Client is the caller's to Close; internal/ratelimit
+// does not own its lifecycle, the same way internal/pgstore's *sql.DB
+// ownership stays with openStore's own caller.
+func openRateLimiter(ctx context.Context, cfg config.Config, log *slog.Logger) (*ratelimit.Limiter, *redis.Client, error) {
+	if cfg.RedisURL == "" {
+		return nil, nil, nil
+	}
+	rcfg, err := redis.ParseURL(cfg.RedisURL)
+	if err != nil {
+		return nil, nil, err
+	}
+	client := redis.New(rcfg)
+
+	pctx, cancel := clock.WithWriteDeadline(ctx, cfg.RateLimitTimeout)
+	defer cancel()
+	if err := client.Ping(pctx); err != nil {
+		_ = client.Close()
+		return nil, nil, fmt.Errorf("connecting to %s: %w", rcfg.Addr, err)
+	}
+
+	perTool := ratelimit.Rule{RatePerSecond: cfg.RateLimitPerToolRate, Burst: cfg.RateLimitPerToolBurst}
+	perHost := ratelimit.Rule{RatePerSecond: cfg.RateLimitPerHostRate, Burst: cfg.RateLimitPerHostBurst}
+	limiter := ratelimit.New(client, ratelimit.Config{
+		PerTool: perTool, PerHost: perHost, KeyPrefix: cfg.RateLimitKeyPrefix,
+	})
+	log.Info("rate limiting is ACTIVE", "redis", rcfg.Addr,
+		"per_tool_enabled", perTool.Enabled(), "per_host_enabled", perHost.Enabled())
+	return limiter, client, nil
+}
+
 // version is stamped at build time:
 //
 //	go build -ldflags "-X main.version=$(git describe --tags --always)" ./cmd/server
@@ -385,6 +425,26 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 	}
 	logPolicy(log, cfg, sandbox)
 
+	limiter, redisClient, err := openRateLimiter(ctx, cfg, log)
+	if err != nil {
+		log.Error("could not connect to Redis for rate limiting", "err", err)
+		return 1
+	}
+	if redisClient != nil {
+		defer func() { _ = redisClient.Close() }()
+	}
+	// Not `RateLimiter: limiter` directly: limiter is a *ratelimit.Limiter
+	// that is nil exactly when RUNMESH_REDIS_URL is unset, and assigning a
+	// nil POINTER straight into an INTERFACE field produces a non-nil
+	// interface wrapping that nil pointer — engine.New's own `d.RateLimiter
+	// == nil` check would then miss it, and the first Allow call would panic
+	// on a nil receiver instead of ever reaching nopRateLimiter. This is the
+	// one place in run() that has to know that.
+	var rl engine.RateLimiter
+	if limiter != nil {
+		rl = limiter
+	}
+
 	eng, err := engine.New(engine.Config{
 		Owner:             cfg.Owner,
 		Workers:           cfg.Workers,
@@ -403,6 +463,7 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 		ConcurrencyErrorRate: cfg.ConcurrencyErrorRate,
 		ConcurrencyHeadroom:  cfg.ConcurrencyHeadroom,
 		ConcurrencyStep:      cfg.ConcurrencyStep,
+		RateLimitTimeout:     cfg.RateLimitTimeout,
 		Backoff: engine.Backoff{
 			Base:   cfg.BackoffBase,
 			Max:    cfg.BackoffMax,
@@ -410,7 +471,7 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 			Jitter: cfg.BackoffJitter,
 		},
 	}, engine.Deps{Store: store, Executor: executor, Sandbox: sandbox,
-		Observer: mset, Clock: clk, Log: log})
+		Observer: mset, RateLimiter: rl, Clock: clk, Log: log})
 	if err != nil {
 		log.Error("could not build the engine", "err", err)
 		return 1

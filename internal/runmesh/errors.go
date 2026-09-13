@@ -81,6 +81,21 @@ const (
 	// configuration permits — an unparseable quantity, or an image outside the
 	// allowed prefixes.
 	CodePolicyViolation = "policy_violation"
+
+	// The rate limiter's own codes. Both are RETRYABLE, which is what tells
+	// them apart from the policy codes just above: a denylist entry stays
+	// wrong forever, a rate limit stops being wrong the moment its bucket
+	// refills.
+	//
+	// CodeRateLimited: a configured bucket - per tool or per external host -
+	// had no token left. The error message names which.
+	CodeRateLimited = "rate_limited"
+	// CodeRateLimitUnavailable: the limiter itself (Redis) could not be
+	// reached. Distinct from CodeRateLimited so an operator reading
+	// runmesh_step_attempt_failures_total can tell "traffic is high, working
+	// as intended" from "the rate limiter is down, go fix it" without having
+	// to read message text.
+	CodeRateLimitUnavailable = "rate_limit_unavailable"
 )
 
 // ToolError is how a tool declares retryability. Anything else a tool returns

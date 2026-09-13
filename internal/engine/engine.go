@@ -80,6 +80,13 @@ type Config struct {
 	ConcurrencyErrorRate float64
 	ConcurrencyHeadroom  float64
 	ConcurrencyStep      int
+
+	// RateLimitTimeout bounds one Deps.RateLimiter.Allow call, the same way
+	// StoreTimeout bounds one store call. A limiter that cannot answer inside
+	// it is treated as unreachable (CodeRateLimitUnavailable) rather than
+	// left to hold a worker for as long as the step's own timeout allows.
+	RateLimitTimeout time.Duration
+
 	// Tools optionally restricts this engine to a subset of the registry. It
 	// is how Week 3 splits in-process tools from container tools across
 	// separate worker fleets without a second scheduler.
@@ -126,6 +133,9 @@ func (c *Config) setDefaults() {
 	}
 	if c.StoreTimeout <= 0 {
 		c.StoreTimeout = 5 * time.Second
+	}
+	if c.RateLimitTimeout <= 0 {
+		c.RateLimitTimeout = 250 * time.Millisecond
 	}
 	if c.AbandonGrace <= 0 {
 		c.AbandonGrace = c.LeaseTTL / 3
@@ -193,17 +203,24 @@ type Deps struct {
 	// on a dispatcher or worker goroutine; see observer.go for what that
 	// obliges an implementation to be.
 	Observer Observer
+	// RateLimiter is optional everywhere, including the server: nil means
+	// nopRateLimiter, which is what RUNMESH_REDIS_URL being unset resolves to
+	// in cmd/server/run.go. Every existing test and every deployment that
+	// predates this feature is unaffected by its arrival for exactly that
+	// reason — see ratelimit.go.
+	RateLimiter RateLimiter
 }
 
 // Engine owns the runtime goroutines.
 type Engine struct {
-	cfg   Config
-	store Store
-	exec  tools.Executor
-	box   Sandbox
-	obs   Observer
-	clock clock.Clock
-	log   *slog.Logger
+	cfg     Config
+	store   Store
+	exec    tools.Executor
+	box     Sandbox
+	obs     Observer
+	limiter RateLimiter
+	clock   clock.Clock
+	log     *slog.Logger
 
 	// leases is unbuffered: a lease is handed directly to a worker that is
 	// already waiting, so a claimed step is never sitting in a queue nobody is
@@ -264,6 +281,9 @@ func New(cfg Config, d Deps) (*Engine, error) {
 	if d.Observer == nil {
 		d.Observer = nopObserver{}
 	}
+	if d.RateLimiter == nil {
+		d.RateLimiter = nopRateLimiter{}
+	}
 	cfg.setDefaults()
 
 	e := &Engine{
@@ -272,6 +292,7 @@ func New(cfg Config, d Deps) (*Engine, error) {
 		exec:         d.Executor,
 		box:          d.Sandbox,
 		obs:          d.Observer,
+		limiter:      d.RateLimiter,
 		clock:        d.Clock,
 		log:          d.Log.With("component", "engine"),
 		leases:       make(chan runmesh.Lease),

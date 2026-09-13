@@ -1,6 +1,8 @@
 # ADR 0002 — PostgreSQL is the queue; Redis is deferred
 
 **Status:** Accepted · implemented in Week 2 ([`internal/pgstore`](../../internal/pgstore))
+· the first role named for Redis below — token-bucket rate limiting — is now
+built; see [ADR 0015](0015-redis-rate-limiting-a-hand-written-resp-client.md)
 
 ## Context
 

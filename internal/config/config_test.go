@@ -45,6 +45,11 @@ func TestLoadDefaults(t *testing.T) {
 		{"ConcurrencyErrorRate", cfg.ConcurrencyErrorRate, 0.2},
 		{"ConcurrencyHeadroom", cfg.ConcurrencyHeadroom, 0.5},
 		{"ConcurrencyStep", cfg.ConcurrencyStep, 1},
+		{"RedisURL", cfg.RedisURL, ""},
+		{"RateLimitPerToolRate", cfg.RateLimitPerToolRate, 0.0},
+		{"RateLimitPerToolBurst", cfg.RateLimitPerToolBurst, 0},
+		{"RateLimitTimeout", cfg.RateLimitTimeout, 250 * time.Millisecond},
+		{"RateLimitKeyPrefix", cfg.RateLimitKeyPrefix, "runmesh"},
 		{"LeaseTTL", cfg.LeaseTTL, 30 * time.Second},
 		{"HeartbeatInterval", cfg.HeartbeatInterval, 5 * time.Second},
 		{"BackoffBase", cfg.BackoffBase, time.Second},
@@ -197,6 +202,30 @@ func TestCrossFieldInvariants(t *testing.T) {
 			name:    "concurrency step below one",
 			env:     map[string]string{"RUNMESH_CONCURRENCY_STEP": "0"},
 			wantHit: "RUNMESH_CONCURRENCY_STEP",
+		},
+		{
+			name:    "negative rate limit rate",
+			env:     map[string]string{"RUNMESH_RATE_LIMIT_PER_TOOL_RATE": "-1"},
+			wantHit: "RUNMESH_RATE_LIMIT_PER_TOOL_RATE",
+		},
+		{
+			name:    "negative rate limit burst",
+			env:     map[string]string{"RUNMESH_RATE_LIMIT_PER_HOST_BURST": "-1"},
+			wantHit: "RUNMESH_RATE_LIMIT_PER_HOST_BURST",
+		},
+		{
+			name:    "rate limit timeout not positive",
+			env:     map[string]string{"RUNMESH_RATE_LIMIT_TIMEOUT": "0s"},
+			wantHit: "RUNMESH_RATE_LIMIT_TIMEOUT",
+		},
+		{
+			// A rate limit needs somewhere to keep its bucket state.
+			name: "rate limit configured without redis",
+			env: map[string]string{
+				"RUNMESH_RATE_LIMIT_PER_TOOL_RATE":  "5",
+				"RUNMESH_RATE_LIMIT_PER_TOOL_BURST": "10",
+			},
+			wantHit: "RUNMESH_REDIS_URL",
 		},
 		{
 			// Fewer than three heartbeats per lease means one slow store call
@@ -399,6 +428,32 @@ func TestMaxWorkersWidensClaimBatchAndTheConnectionPool(t *testing.T) {
 	// put it at 8, MaxWorkers=8 puts it at 12.
 	if want := 8 + 4; cfg.DBMaxOpenConns != want { // dbConnHeadroom is 4
 		t.Errorf("DBMaxOpenConns = %d, want %d (RUNMESH_MAX_WORKERS + headroom)", cfg.DBMaxOpenConns, want)
+	}
+}
+
+// TestRateLimitAcceptedWithRedisConfigured: the cross-field refusal in
+// TestCrossFieldInvariants only fires when RUNMESH_REDIS_URL is empty: once
+// it is set, both dimensions load exactly as given.
+func TestRateLimitAcceptedWithRedisConfigured(t *testing.T) {
+	t.Parallel()
+	cfg, err := config.Load(env(map[string]string{
+		"RUNMESH_REDIS_URL":                 "redis://127.0.0.1:6379",
+		"RUNMESH_RATE_LIMIT_PER_TOOL_RATE":  "5",
+		"RUNMESH_RATE_LIMIT_PER_TOOL_BURST": "10",
+		"RUNMESH_RATE_LIMIT_PER_HOST_RATE":  "2",
+		"RUNMESH_RATE_LIMIT_PER_HOST_BURST": "5",
+	}))
+	if err != nil {
+		t.Fatalf("a fully-configured rate limit was rejected: %v", err)
+	}
+	if cfg.RedisURL != "redis://127.0.0.1:6379" {
+		t.Errorf("RedisURL = %q", cfg.RedisURL)
+	}
+	if cfg.RateLimitPerToolRate != 5 || cfg.RateLimitPerToolBurst != 10 {
+		t.Errorf("PerTool = %v/%d, want 5/10", cfg.RateLimitPerToolRate, cfg.RateLimitPerToolBurst)
+	}
+	if cfg.RateLimitPerHostRate != 2 || cfg.RateLimitPerHostBurst != 5 {
+		t.Errorf("PerHost = %v/%d, want 2/5", cfg.RateLimitPerHostRate, cfg.RateLimitPerHostBurst)
 	}
 }
 

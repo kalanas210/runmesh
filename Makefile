@@ -35,6 +35,13 @@ export RUNMESH_PROMETHEUS_PORT
 RUNMESH_GRAFANA_PORT ?= 3001
 export RUNMESH_GRAFANA_PORT
 
+# The host port the local Redis is published on, overridable exactly like the
+# database port and for exactly the same reason:
+#
+#   make test-redis RUNMESH_REDIS_PORT=6380
+RUNMESH_REDIS_PORT ?= 6379
+export RUNMESH_REDIS_PORT
+
 # The k6 script `make load` runs. Overridable the same way, so a second
 # scenario is `make load K6_SCRIPT=tests/load/soak.js` rather than a second
 # target that has to be kept in step with this one.
@@ -87,6 +94,18 @@ monitoring-up: ## Start Prometheus and Grafana and wait for them
 .PHONY: monitoring-down
 monitoring-down: ## Stop Prometheus and Grafana, keeping their data
 	docker compose --profile monitoring stop prometheus grafana
+
+# Redis sits behind its own `ratelimit` compose profile, exactly like
+# monitoring: `db-up` and every other compose command here keep pulling and
+# waiting for nothing new. Rate limiting is itself opt-in — see ADR 0015 —
+# so its dependency costs nothing until asked for either.
+.PHONY: redis-up
+redis-up: ## Start the local Redis and wait for it
+	docker compose --profile ratelimit up -d --wait redis
+
+.PHONY: redis-down
+redis-down: ## Stop the local Redis (no data to keep; see docker-compose.yml)
+	docker compose --profile ratelimit stop redis
 
 .PHONY: test
 test: ## Run all tests (PostgreSQL cases skip without RUNMESH_TEST_DATABASE_URL)
@@ -178,6 +197,14 @@ test-pg: db-up ## Run the suite against the local PostgreSQL
 .PHONY: test-integration
 test-integration: db-up ## Run the integration suite against the local PostgreSQL
 	RUNMESH_TEST_DATABASE_URL='postgres://runmesh:runmesh@127.0.0.1:$(RUNMESH_DB_PORT)/runmesh?sslmode=disable' go test -count=1 -tags=integration ./tests/integration/...
+
+# internal/redis and internal/ratelimit SKIP when this is unset, exactly the
+# shape RUNMESH_TEST_DATABASE_URL gives the PostgreSQL suite. This is the
+# target that proves the hand-written RESP client and the token bucket it
+# backs actually work — see ADR 0015.
+.PHONY: test-redis
+test-redis: redis-up ## Run the suite against the local Redis
+	RUNMESH_TEST_REDIS_URL='redis://127.0.0.1:$(RUNMESH_REDIS_PORT)' go test -race -count=1 $(PKG)
 
 .PHONY: tidy
 tidy: ## Tidy go.mod

@@ -241,6 +241,15 @@ func (e *Engine) invoke(ctx context.Context, log *slog.Logger, l runmesh.Lease, 
 		return
 	}
 
+	// The rate limiter is consulted here, after the sandbox and before the
+	// tool runs, so a refusal never lets Executor.Execute create a Kubernetes
+	// Job for an attempt that is not going to happen. Unlike a Sandbox
+	// refusal this one is retryable — see checkRateLimit.
+	if err := e.checkRateLimit(ctx, l); err != nil {
+		done <- toolResult{err: err}
+		return
+	}
+
 	// Bracketing Execute and NOTHING else is the point of measuring here rather
 	// than in settle: the difference between this span and the attempt span is
 	// Store.Start plus the heartbeats plus the settle write, and that difference

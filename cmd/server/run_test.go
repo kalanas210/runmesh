@@ -6,11 +6,15 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/kalanas210/runmesh/internal/ratelimit"
+	"github.com/kalanas210/runmesh/internal/redis"
 )
 
 const testKey = "test-key-0123456789abcdef"
@@ -556,5 +560,81 @@ func TestMissingAPIKeysRefusesToStart(t *testing.T) {
 	}
 	if !strings.Contains(errOut.String(), "RUNMESH_API_KEYS") {
 		t.Fatalf("the error does not name the missing variable: %s", errOut.String())
+	}
+}
+
+// TestEndToEndRateLimitRefusesAnAttempt is the acceptance test for the rate
+// limiter wired end to end: a real server, a real Redis, a real HTTP submit.
+//
+// The bucket is pre-exhausted through internal/ratelimit's own public API —
+// the same package the running server consults, not a raw Redis command —
+// BEFORE the server boots, so the very first attempt the running server ever
+// makes finds it already empty. MaxAttempts=1 turns that refusal into an
+// immediately TERMINAL Failed rather than a Retrying step this test would
+// otherwise have to wait out (see engine.Classify: a retryable ToolError
+// only retries while failures+1 < maxAttempts).
+func TestEndToEndRateLimitRefusesAnAttempt(t *testing.T) {
+	redisURL := os.Getenv("RUNMESH_TEST_REDIS_URL")
+	if redisURL == "" {
+		t.Skip("set RUNMESH_TEST_REDIS_URL to run the rate limiter's end-to-end test, " +
+			"e.g. redis://127.0.0.1:6379 (docker compose --profile ratelimit up -d --wait redis)")
+	}
+	rcfg, err := redis.ParseURL(redisURL)
+	if err != nil {
+		t.Fatalf("ParseURL: %v", err)
+	}
+	rc := redis.New(rcfg)
+	t.Cleanup(func() { _ = rc.Close() })
+
+	// t.Name() is a unique namespace WITHIN one run; deleting before AND
+	// after is what keeps two separate runs from sharing a stale bucket —
+	// the refill rate below is deliberately too slow for that to self-heal.
+	prefix := "runmesh:test:" + t.Name()
+	cleanupBucket := func() {
+		v, err := rc.Do(context.Background(), "KEYS", prefix+":ratelimit:*")
+		if err != nil {
+			return
+		}
+		for _, k := range v.Array {
+			_, _ = rc.Do(context.Background(), "DEL", string(k.Bulk))
+		}
+	}
+	cleanupBucket()
+	t.Cleanup(cleanupBucket)
+
+	// One token per ~16 minutes: for the life of this test, indistinguishable
+	// from never refilling at all.
+	rule := ratelimit.Rule{RatePerSecond: 0.001, Burst: 1}
+	pre := ratelimit.New(rc, ratelimit.Config{PerTool: rule, KeyPrefix: prefix})
+	if d, err := pre.Allow(t.Context(), "echo", nil); err != nil || !d.Allowed {
+		t.Fatalf("pre-exhausting the bucket: Allow = %+v, %v; want the first request allowed", d, err)
+	}
+
+	baseURL, _ := boot(t, map[string]string{
+		"RUNMESH_REDIS_URL":                 redisURL,
+		"RUNMESH_RATE_LIMIT_PER_TOOL_RATE":  "0.001",
+		"RUNMESH_RATE_LIMIT_PER_TOOL_BURST": "1",
+		"RUNMESH_RATE_LIMIT_KEY_PREFIX":     prefix,
+	})
+
+	plan := `{"name": "rate-limit-check", "steps": [{"id": "s", "tool": "echo", "max_attempts": 1}]}`
+	status, body := request(t, http.MethodPost, baseURL+"/api/v1/jobs", plan, nil)
+	if status != http.StatusCreated {
+		t.Fatalf("POST /jobs = %d, want 201. body: %s", status, body)
+	}
+	var created jobView
+	if err := json.Unmarshal(body, &created); err != nil {
+		t.Fatalf("decode created job: %v", err)
+	}
+
+	job := waitForJob(t, baseURL, created.ID)
+	if job.State != "FAILED" {
+		t.Fatalf("job state = %s, want FAILED (rate limited). steps: %+v", job.State, job.Steps)
+	}
+	if len(job.Steps) != 1 {
+		t.Fatalf("%d steps, want 1", len(job.Steps))
+	}
+	if s := job.Steps[0]; s.Error == nil || s.Error.Code != "rate_limited" {
+		t.Errorf("step error = %+v, want code rate_limited", s.Error)
 	}
 }

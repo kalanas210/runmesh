@@ -133,6 +133,24 @@ type Config struct {
 	PolicyDenyTools               []string
 	PolicyImagePrefixes           []string
 
+	// Rate limiting: token-bucket limits shared across replicas through
+	// Redis, one bucket per tool name and one per external host a tool
+	// contacts. RedisURL empty disables the feature entirely — every tool and
+	// every host runs unlimited, the same as before this existed. Each
+	// dimension is independently off unless BOTH its rate and its burst are
+	// set above zero (see ratelimit.Rule.Enabled), so a deployment can limit
+	// hosts without limiting tools, or the other way round. See ADR 0015.
+	RedisURL              string
+	RateLimitPerToolRate  float64
+	RateLimitPerToolBurst int
+	RateLimitPerHostRate  float64
+	RateLimitPerHostBurst int
+	RateLimitTimeout      time.Duration
+	// RateLimitKeyPrefix namespaces every bucket key this deployment writes,
+	// so more than one RunMesh deployment can share one Redis without their
+	// buckets colliding. Defaults to "runmesh".
+	RateLimitKeyPrefix string
+
 	// Tools
 	EnableTestTools bool
 	MaxOutputBytes  int
@@ -296,6 +314,16 @@ func Load(getenv func(string) string) (Config, error) {
 		PolicyAllowTools:    l.csv("RUNMESH_POLICY_TOOLS_ALLOW"),
 		PolicyDenyTools:     l.csv("RUNMESH_POLICY_TOOLS_DENY"),
 		PolicyImagePrefixes: l.csv("RUNMESH_POLICY_IMAGE_PREFIXES"),
+
+		RedisURL: l.str("RUNMESH_REDIS_URL", ""),
+		// Zero for both rate and burst is Rule.Enabled's own "off"; there is
+		// no separate boolean switch per dimension because none is needed.
+		RateLimitPerToolRate:  l.float("RUNMESH_RATE_LIMIT_PER_TOOL_RATE", 0),
+		RateLimitPerToolBurst: l.num("RUNMESH_RATE_LIMIT_PER_TOOL_BURST", 0),
+		RateLimitPerHostRate:  l.float("RUNMESH_RATE_LIMIT_PER_HOST_RATE", 0),
+		RateLimitPerHostBurst: l.num("RUNMESH_RATE_LIMIT_PER_HOST_BURST", 0),
+		RateLimitTimeout:      l.dur("RUNMESH_RATE_LIMIT_TIMEOUT", 250*time.Millisecond),
+		RateLimitKeyPrefix:    l.str("RUNMESH_RATE_LIMIT_KEY_PREFIX", "runmesh"),
 
 		EnableTestTools: l.boolean("RUNMESH_ENABLE_TEST_TOOLS", false),
 		MaxOutputBytes:  l.num("RUNMESH_MAX_OUTPUT_BYTES", 64<<10),
@@ -580,6 +608,36 @@ func (c Config) Validate() []error {
 	}
 	if c.MaxRequestBytes < 1 {
 		bad("RUNMESH_MAX_REQUEST_BYTES must be >= 1, got %d", c.MaxRequestBytes)
+	}
+	if c.RateLimitPerToolRate < 0 {
+		bad("RUNMESH_RATE_LIMIT_PER_TOOL_RATE must be >= 0, got %v", c.RateLimitPerToolRate)
+	}
+	if c.RateLimitPerToolBurst < 0 {
+		bad("RUNMESH_RATE_LIMIT_PER_TOOL_BURST must be >= 0, got %d", c.RateLimitPerToolBurst)
+	}
+	if c.RateLimitPerHostRate < 0 {
+		bad("RUNMESH_RATE_LIMIT_PER_HOST_RATE must be >= 0, got %v", c.RateLimitPerHostRate)
+	}
+	if c.RateLimitPerHostBurst < 0 {
+		bad("RUNMESH_RATE_LIMIT_PER_HOST_BURST must be >= 0, got %d", c.RateLimitPerHostBurst)
+	}
+	if c.RateLimitTimeout <= 0 {
+		bad("RUNMESH_RATE_LIMIT_TIMEOUT must be > 0, got %s", c.RateLimitTimeout)
+	}
+	// A rate or a burst set without RUNMESH_REDIS_URL is a dimension with
+	// nowhere to keep its bucket state - refused now, the same way a
+	// misconfigured deployment is refused everywhere else in this file,
+	// rather than silently running unlimited and looking configured when it
+	// is not.
+	if c.RedisURL == "" {
+		if c.RateLimitPerToolRate > 0 || c.RateLimitPerToolBurst > 0 {
+			bad("RUNMESH_RATE_LIMIT_PER_TOOL_RATE/BURST is set but RUNMESH_REDIS_URL is empty: " +
+				"a rate limit needs somewhere to keep its bucket state")
+		}
+		if c.RateLimitPerHostRate > 0 || c.RateLimitPerHostBurst > 0 {
+			bad("RUNMESH_RATE_LIMIT_PER_HOST_RATE/BURST is set but RUNMESH_REDIS_URL is empty: " +
+				"a rate limit needs somewhere to keep its bucket state")
+		}
 	}
 	switch c.Planner {
 	case PlannerNone, PlannerHeuristic:

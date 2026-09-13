@@ -44,6 +44,24 @@
 # from a Grafana that quietly failed to bind is the same afternoon the
 # RUNMESH_DB_PORT paragraph above exists to prevent.
 #
+# ─── Rate limiting ───────────────────────────────────────────────────────────
+#
+# Redis is behind its own `ratelimit` compose PROFILE, exactly like monitoring
+# — `docker compose up -d postgres` and `make db-up` know nothing new exists.
+#
+#   docker compose --profile ratelimit up -d --wait redis
+#   export RUNMESH_REDIS_URL='redis://127.0.0.1:6379'
+#   go run ./cmd/server
+#
+# Unset RUNMESH_REDIS_URL and the feature is off — every tool and every host
+# runs unlimited, exactly as if Redis were never mentioned. See ADR 0015 for
+# why the client that speaks to it is hand-written rather than a dependency,
+# and RUNMESH_TEST_REDIS_URL is the same idea RUNMESH_TEST_DATABASE_URL is,
+# one line up: set it and `internal/redis`'s own suite stops skipping.
+#
+# No named volume: bucket state is disposable by design (see the service's own
+# comment below), so there is nothing here for `db-reset` to need to know about.
+#
 # Prometheus scrapes host.docker.internal:8080 rather than a service name,
 # because RunMesh is not a compose service — it still runs on the host with
 # `go run ./cmd/server`, for the reason at the top of this file. Docker Desktop
@@ -96,6 +114,34 @@ services:
       - "synchronous_commit=off"
       - "-c"
       - "max_connections=200"
+
+  redis:
+    # Behind its own profile for the same reason `monitoring` is: the default
+    # `docker compose up -d postgres` / `make db-up` pulls and waits for
+    # nothing new, and neither knows this service exists. Rate limiting is
+    # itself opt-in — RUNMESH_REDIS_URL unset disables it entirely, see
+    # ADR 0015 — so its dependency should cost nothing until asked for either.
+    profiles: ["ratelimit"]
+    image: redis:7-alpine
+    container_name: runmesh-redis
+    ports:
+      - "${RUNMESH_REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+    command:
+      # No persistence at all: RDB snapshots and the AOF both cost disk I/O
+      # for state that is, by design, safe to lose. A restart with an empty
+      # store just means every bucket starts full again — the same "benign on
+      # loss" property that makes Redis the right tool for this role in the
+      # first place (see ADR 0002).
+      - "redis-server"
+      - "--save"
+      - ""
+      - "--appendonly"
+      - "no"
 
   prometheus:
     # The profile is the whole reason the lightweight default survives. A
