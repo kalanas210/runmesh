@@ -1,0 +1,17 @@
+# The build context for deploy/docker/*.Dockerfile.
+#
+# The server and task images COPY the whole tree and compile Go; the Python
+# image copies one file. None of them needs the dashboard, the git history or
+# anything machine-local, so all of that stays out: a context without
+# web/node_modules is a fraction of the size, and a context without .env files
+# cannot copy a local credential into a build layer.
+.git
+web/
+**/node_modules
+.env
+.env.*
+.claude/
+bin/
+dist/
+*.out
+coverage*
