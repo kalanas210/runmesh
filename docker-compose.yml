@@ -25,6 +25,42 @@
 # runs INSIDE the container and knows nothing about who owns the host port. What
 # actually happened is that the connection reached somebody else's PostgreSQL.
 # `netstat -ano | grep :5433` names the owner.
+#
+# ─── Monitoring ──────────────────────────────────────────────────────────────
+#
+# Prometheus and Grafana are behind the `monitoring` compose PROFILE, so the
+# default stays exactly as cheap as it was — `docker compose up -d postgres`
+# and `make db-up` bring up the database and nothing else, and neither knows
+# these services exist:
+#
+#   make monitoring-up            # ./task.ps1 monitoring-up on Windows
+#   go run ./cmd/server
+#   open http://127.0.0.1:9090/targets   and   http://127.0.0.1:3001
+#
+# Prometheus publishes on ${RUNMESH_PROMETHEUS_PORT:-9090} and Grafana on
+# ${RUNMESH_GRAFANA_PORT:-3001}, both overridable the same way the database
+# port is. Grafana's own default is 3000 and is deliberately NOT used: the
+# Next.js dashboard in web/ takes 3000 with `next dev`, and finding that out
+# from a Grafana that quietly failed to bind is the same afternoon the
+# RUNMESH_DB_PORT paragraph above exists to prevent.
+#
+# Prometheus scrapes host.docker.internal:8080 rather than a service name,
+# because RunMesh is not a compose service — it still runs on the host with
+# `go run ./cmd/server`, for the reason at the top of this file. Docker Desktop
+# resolves that name natively; the `extra_hosts: host-gateway` line below is
+# what makes it work on Linux and in CI.
+#
+# GET /api/v1/metrics is SCOPED (metrics.read), so the scrape carries a bearer
+# credential. It is mounted as a file rather than pasted into a config;
+# deploy/prometheus/prometheus.yml argues why at length, and
+# RUNMESH_SCRAPE_TOKEN_FILE points the mount at a real one.
+#
+# One consequence of `db-reset` worth knowing: it is `docker compose down -v`,
+# which removes EVERY named volume in the project, including these two. Almost
+# nothing is lost — the datasource and every dashboard are provisioned from
+# deploy/grafana on each start, so only Grafana's own sqlite (logins, stars,
+# preferences) goes. Prometheus's stored samples do go with it, which matters
+# only if you were mid-investigation.
 
 services:
   postgres:
@@ -61,5 +97,109 @@ services:
       - "-c"
       - "max_connections=200"
 
+  prometheus:
+    # The profile is the whole reason the lightweight default survives. A
+    # service with a profile is invisible to every compose command that does
+    # not ask for it by name or by `--profile monitoring`, so `up -d postgres`,
+    # `make db-up` and `make test-pg` pull nothing new and wait for nothing new.
+    profiles: ["monitoring"]
+    image: prom/prometheus:v3.7.3
+    container_name: runmesh-prometheus
+    ports:
+      - "${RUNMESH_PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      # The bearer credential for the scoped endpoint, as a file. Read fresh on
+      # every scrape, so rotating the scrape key is a write to this file rather
+      # than a container restart — and the token never appears in this document,
+      # in `git log -p`, or in Prometheus's own /api/v1/status/config output.
+      # The default is the tracked `.example` file, so a clean clone brings up a
+      # working stack. A real deployment overrides it — with
+      # RUNMESH_SCRAPE_TOKEN_FILE, or by creating
+      # deploy/prometheus/scrape-token, which .gitignore covers. The default
+      # deliberately does NOT point at that gitignored path: a bind mount whose
+      # source is missing makes Docker silently create a DIRECTORY there, and
+      # Prometheus then fails with a read error on something that looks like a
+      # file in every listing.
+      - "${RUNMESH_SCRAPE_TOKEN_FILE:-./deploy/prometheus/scrape-token.example}:/etc/prometheus/scrape-token:ro"
+      - runmesh-prometheus-data:/prometheus
+    extra_hosts:
+      # Docker Desktop provides this name already; Linux and GitHub Actions do
+      # not, and without this line the scrape config's only target resolves to
+      # nothing and the job sits permanently DOWN with a DNS error that reads
+      # like a Prometheus bug rather than a platform difference.
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      # /-/healthy answers as soon as the web stack is up, which is what
+      # `--wait` should return on. /-/ready would also wait for the TSDB to
+      # finish replaying its WAL — correct for a rolling deployment, needless
+      # here, and the difference is a few seconds added to every monitoring-up.
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/-/healthy"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      # A week, because this is a laptop and the question a developer asks is
+      # "what did that load run do", never "what did last quarter look like".
+      - "--storage.tsdb.retention.time=7d"
+      # Makes `curl -XPOST localhost:9090/-/reload` pick up an edit to
+      # prometheus.yml without losing the samples already collected. Dangerous
+      # on a public port and entirely fine on one bound to a developer machine.
+      - "--web.enable-lifecycle"
+
+  grafana:
+    profiles: ["monitoring"]
+    image: grafana/grafana:12.3.0
+    container_name: runmesh-grafana
+    environment:
+      # admin/admin, and that is a deliberate local-only choice rather than an
+      # oversight: this instance is reachable from one machine, it holds no
+      # data that is not derivable from a running server, and a generated
+      # password would only mean looking it up every time. Anything reachable
+      # by anyone else needs a real one, set here.
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      # Anonymous viewers, so the dashboard opens without a login prompt for
+      # somebody who just wants to see whether the engine or the tool is slow.
+      # Viewer cannot edit, and every dashboard is provisioned read-only from
+      # disk anyway.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      # No phoning home from a developer machine, and no update banner on a
+      # pinned image that is not going to be updated by clicking it.
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_LOG_LEVEL: warn
+    ports:
+      # Host 3001, container 3000 — the same shape as the database mapping: the
+      # port INSIDE the container never moves, so nothing but the browser URL
+      # changes when the host side does.
+      - "${RUNMESH_GRAFANA_PORT:-3001}:3000"
+    volumes:
+      # Provisioning is what makes this stack reproducible: the datasource and
+      # the dashboard are files, applied at startup, so a wiped volume costs
+      # nothing and a dashboard edit made in the browser is not the source of
+      # truth for anything.
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - runmesh-grafana-data:/var/lib/grafana
+    depends_on:
+      prometheus:
+        # Grafana starting before its datasource is reachable is not fatal —
+        # provisioning retries — but it does produce a first page load full of
+        # red "datasource not found" panels, which is an alarming way to meet a
+        # stack that is working.
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:3000/api/health || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
 volumes:
   runmesh-pgdata:
+  runmesh-prometheus-data:
+  runmesh-grafana-data:

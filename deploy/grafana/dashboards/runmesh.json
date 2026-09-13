@@ -1,0 +1,3847 @@
+{
+  "uid": "runmesh-overview",
+  "title": "RunMesh",
+  "description": "RunMesh — engine, store and HTTP surface.\n\nEvery panel here queries a metric this binary ACTUALLY exports. The exhaustive list is internal/metrics/set.go (the one table where a metric name, help string, label vocabulary or bucket slice is spelled), plus gauges.go and runtimecol.go; a panel querying something the process never emits is worse than no panel, because an empty graph reads as a healthy zero.\n\nTHE go_* PANELS USE THIS PROJECT'S OWN NAMES, NOT client_golang's. RunMesh hand-rolls its Prometheus text exposition rather than taking the client library (ADR 0012, docs/decisions/0012-metrics-without-a-client-library.md), so there is no go_memstats_* family, no go_info, no go_threads, and no process_cpu_seconds_total, process_resident_memory_bytes or process_open_fds. What exists is exactly go_goroutines, go_gc_cycles_total, go_gc_heap_allocs_bytes_total, go_memory_heap_objects_bytes, go_memory_total_bytes, go_cpu_gc_seconds_total, go_sched_latencies_seconds and process_start_time_seconds. An imported community 'Go Processes' dashboard will render entirely empty against this binary, and this dashboard shipping alongside the ADR is the agreed mitigation for that. Note in particular that go_memory_total_bytes is the Go runtime's mapped memory and is NOT resident set size: the exporter deliberately refuses to name an approximation after the real thing.\n\nWHERE TO START. 'Scrape target' says whether anything is being collected at all. After that the section that earns this dashboard is 'Attempt duration — is the engine slow, or is the tool?': attempt duration brackets the store write, the heartbeats and the settle as well as the tool, tool duration brackets Executor.Execute and nothing else, and the difference between them is the single question this instrumentation was built to answer.\n\nThe scrape is authenticated — GET /api/v1/metrics carries the metrics.read scope — so a blank dashboard with a healthy server is usually a scrape credential, not a bug. deploy/prometheus/prometheus.yml is where that lives.",
+  "tags": [
+    "runmesh"
+  ],
+  "timezone": "browser",
+  "editable": false,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      },
+      {
+        "datasource": {
+          "type": "prometheus",
+          "uid": "runmesh-prometheus"
+        },
+        "enable": true,
+        "hide": false,
+        "iconColor": "purple",
+        "name": "Server restarts",
+        "expr": "changes(process_start_time_seconds[$__rate_interval]) > 0",
+        "titleFormat": "runmesh restarted",
+        "step": "60s"
+      }
+    ]
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "tool",
+        "label": "tool",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "runmesh-prometheus"
+        },
+        "query": {
+          "qryType": 1,
+          "query": "label_values(runmesh_step_attempt_duration_seconds_count, tool)",
+          "refId": "tool"
+        },
+        "definition": "label_values(runmesh_step_attempt_duration_seconds_count, tool)",
+        "refresh": 2,
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "options": [],
+        "sort": 1,
+        "hide": 0,
+        "description": "The tool vocabulary is closed at wiring time — it comes from the tool registry — so this list can never grow with traffic, only with a new tool being registered."
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Scrape target",
+      "description": "up{job=\"runmesh\"} — 1 when Prometheus last scraped GET /api/v1/metrics successfully, 0 when it could not.\n\nThis is the first panel to read when every other panel is empty, because it separates the two failures that look identical from a blank dashboard: the server is not running, or the scrape credential is wrong. A 401 shows here as 0 exactly like a connection refused does; http://127.0.0.1:9090/targets says which.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "runmesh-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "mappings": [],
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "up{job=\"runmesh\"}",
+          "range": false,
+          "instant": true,
+          "legendFormat": "up"
+        }
+      ],
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 0
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Queue depth",
+      "description": "runmesh_queue_depth — steps that are claimable right now.\n\nRead it against 'In flight' beside it. Depth high and in-flight at the pool size is a pool too small for the offered load; depth high and in-flight well under the pool size is a dispatcher or a store that cannot hand work over fast enough, and the 'Worker pool and dispatcher' section is where that gets settled.\n\nThe exporter recomputes this at most every 5s no matter how often Prometheus asks, because the underlying query is a full scan under the same lock that serialises Claim and Finish.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "runmesh-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "mappings": [],
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "wideLayout": true
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "runmesh_queue_depth",
+          "range": false,
+          "instant": true,
+          "legendFormat": "depth"
+        }
+      ],
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 0
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "In flight",
+      "description": "runmesh_workers_inflight — steps executing at this instant.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "runmesh-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "mappings": [],
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "wideLayout": true
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "runmesh_workers_inflight",
+          "range": false,
+          "instant": true,
+          "legendFormat": "inflight"
+        }
+      ],
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 0
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Pool saturation",
+      "description": "runmesh_workers_inflight / runmesh_workers.\n\nPinned at 100% with a non-zero queue depth is the one unambiguous 'raise RUNMESH_WORKERS' signal on this dashboard.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "runmesh-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "mappings": [],
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.8
+              },
+              {
+                "color": "orange",
+                "value": 0.95
+              }
+            ]
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "wideLayout": true
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "runmesh_workers_inflight / runmesh_workers",
+          "range": false,
+          "instant": true,
+          "legendFormat": "saturation"
+        }
+      ],
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 0
+      }
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Attempts / sec",
+      "description": "sum(rate(runmesh_step_attempts_total)) — decided attempts per second, which is this system's throughput.\n\nIt counts what a worker DECIDED, on every exit path of settle, including the ones where nothing was written to the store. That is deliberate: it keeps this number equal to the count of 'step settled' log lines, and a failed store write is already counted, by operation, in the Store section.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "runmesh-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "mappings": [],
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "decimals": 2
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "wideLayout": true
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(runmesh_step_attempts_total[$__rate_interval]))",
+          "range": false,
+          "instant": true,
+          "legendFormat": "attempts/s"
+        }
+      ],
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 16,
+        "y": 0
+      }
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Build",
+      "description": "runmesh_build_info — the version stamped at link time and the Go toolchain that built it, carried as labels on a gauge pinned at 1, which is the Prometheus idiom for a fact rather than a measurement.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "runmesh-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "mappings": [],
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "runmesh_build_info",
+          "range": false,
+          "instant": true,
+          "legendFormat": "{{version}} · {{go_version}}"
+        }
+      ],
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 0
+      }
+    },
+    {
+      "id": 7,
+      "type": "row",
+      "title": "Throughput and queue depth",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 4
+      }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Attempt outcomes",
+      "description": "sum by (state) (rate(runmesh_step_attempts_total)) — every decided attempt, by the state the step was moved to.\n\nStacked, so the total height is throughput and the composition is health. RETRYING is the series to watch: it is not an error yet, but a RETRYING band that grows while SUCCEEDED does not is work being redone rather than done.\n\nThere is deliberately no separate retries-scheduled counter in this binary — it would be exactly this series, and a second counter for a number already derivable is a second thing to keep in agreement.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "runmesh-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 40,
+            "showPoints": "never",
+            "spanNulls": false,
+            "pointSize": 5,
+            "gradientMode": "none",
+            "barAlignment": 0,
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (state) (rate(runmesh_step_attempts_total{tool=~\"$tool\"}[$__rate_interval]))",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{state}}"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 5
+      }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Queue depth against the pool",
+      "description": "runmesh_queue_depth, runmesh_workers_inflight and runmesh_workers on one axis, because the interesting quantity is the relationship between them rather than any one of the three.\n\nDepth climbing with in-flight flat at the pool ceiling: add workers. Depth climbing with in-flight below the ceiling: the pool is not the constraint, and 'Claim fill ratio' and 'Hand-off wait' say what is.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "runmesh-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "pointSize": 5,
+            "gradientMode": "none",
+            "barAlignment": 0,
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0,
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "runmesh_queue_depth",
+          "range": true,
+          "instant": false,
+          "legendFormat": "queue depth"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "runmesh_workers_inflight",
+          "range": true,
+          "instant": false,
+          "legendFormat": "in flight"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "runmesh_workers",
+          "range": true,
+          "instant": false,
+          "legendFormat": "pool size"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 5
+      }
+    },
+    {
+      "id": 10,
+      "type": "row",
+      "title": "Attempt duration — is the engine slow, or is the tool?",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 13
+      },
+      "description": "The section Week 6 exists for. runmesh_step_attempt_duration_seconds brackets Store.Start, every heartbeat and the settle write as well as the tool itself; runmesh_tool_duration_seconds brackets Executor.Execute and nothing else. Neither number answers the question alone — the DIFFERENCE between them does."
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Attempt duration p95 by tool",
+      "description": "histogram_quantile(0.95, ...runmesh_step_attempt_duration_seconds_bucket) — the whole attempt: store write, tool, heartbeats, settle.\n\nThe bucket boundaries are fixed at compile time and span 5ms to 600s, with a boundary deliberately placed on 30 because that is the default lease TTL: 'how many attempts outran their lease' is a question this histogram can answer exactly rather than by interpolation.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "runmesh-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "pointSize": 5,
+            "gradientMode": "none",
+            "barAlignment": 0,
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (tool, le) (rate(runmesh_step_attempt_duration_seconds_bucket{tool=~\"$tool\"}[$__rate_interval])))",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{tool}}"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 14
+      }
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Tool duration p95 by tool",
+      "description": "histogram_quantile(0.95, ...runmesh_tool_duration_seconds_bucket) — time inside Executor.Execute alone.\n\nUnder the Kubernetes executor this includes pod scheduling, image pull and container start, which is why a cold image shows up here as a step change in one tool's p95 and nowhere else.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "runmesh-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "pointSize": 5,
+            "gradientMode": "none",
+            "barAlignment": 0,
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (tool, le) (rate(runmesh_tool_duration_seconds_bucket{tool=~\"$tool\"}[$__rate_interval])))",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{tool}}"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 14
+      }
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Engine overhead per attempt (mean)",
+      "description": "(rate(attempt_duration_sum) - rate(tool_duration_sum)) / rate(attempt_duration_count), by tool — the seconds of every attempt that were NOT spent inside the tool.\n\nThis is the rigorous form of the question, and it is a mean rather than a quantile on purpose: a p95 minus a p95 is not the p95 of the difference, and the two quantiles need not even describe the same attempts. Sums divided by counts do subtract honestly.\n\nRising here and flat next door means the engine got slower — store latency, heartbeat pressure, or a worker that could not be handed its lease — and the Store and dispatcher sections are where that resolves. Flat here and rising next door means the tool got slower and none of this is RunMesh's fault.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "runmesh-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "pointSize": 5,
+            "gradientMode": "none",
+            "barAlignment": 0,
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "(\n  sum by (tool) (rate(runmesh_step_attempt_duration_seconds_sum{tool=~\"$tool\"}[$__rate_interval]))\n  -\n  sum by (tool) (rate(runmesh_tool_duration_seconds_sum{tool=~\"$tool\"}[$__rate_interval]))\n)\n/\n(sum by (tool) (rate(runmesh_step_attempt_duration_seconds_count{tool=~\"$tool\"}[$__rate_interval])) > 0)",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{tool}}"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 14
+      }
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Share of attempt spent inside the tool",
+      "description": "rate(tool_duration_sum) / rate(attempt_duration_sum), by tool.\n\nThe same fact as the panel to its left, normalised, and the one to put in front of somebody who does not want to reason about absolute seconds: at 0.95 the engine is a rounding error and the tool owns the latency; at 0.4 most of every attempt is RunMesh's own overhead and that is a bug to go and find.\n\nValues are undefined while a tool is idle — the denominator is zero and the series simply stops, which is why the line is drawn with spanNulls off rather than bridged across a gap that would imply a measurement nobody took.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "runmesh-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "pointSize": 5,
+            "gradientMode": "none",
+            "barAlignment": 0,
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (tool) (rate(runmesh_tool_duration_seconds_sum{tool=~\"$tool\"}[$__rate_interval]))\n/\n(sum by (tool) (rate(runmesh_step_attempt_duration_seconds_sum{tool=~\"$tool\"}[$__rate_interval])) > 0)",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{tool}}"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 22
+      }
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "Dispatch wait p95 by tool",
+      "description": "histogram_quantile(0.95, ...runmesh_step_dispatch_wait_seconds_bucket) — from a step being claimed to it actually starting.\n\nPer-tool rather than aggregate because under Kubernetes this IS pod pending time, and one tool waiting on a cold image or an unschedulable node is invisible in an average across all of them.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "runmesh-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "pointSize": 5,
+            "gradientMode": "none",
+            "barAlignment": 0,
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (tool, le) (rate(runmesh_step_dispatch_wait_seconds_bucket{tool=~\"$tool\"}[$__rate_interval])))",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{tool}}"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 22
+      }
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "Attempt duration percentiles, all tools",
+      "description": "p50, p95 and p99 of runmesh_step_attempt_duration_seconds across every tool.\n\nThe spread between the three is the shape of the workload: p50 and p99 close together is uniform work, and a p99 an order of magnitude above p50 is a bimodal mix — which is the case where an average is actively misleading and the per-tool panels above are the only useful cut.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "runmesh-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "pointSize": 5,
+            "gradientMode": "none",
+            "barAlignment": 0,
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(runmesh_step_attempt_duration_seconds_bucket{tool=~\"$tool\"}[$__rate_interval])))",
+          "range": true,
+          "instant": false,
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(runmesh_step_attempt_duration_seconds_bucket{tool=~\"$tool\"}[$__rate_interval])))",
+          "range": true,
+          "instant": false,
+          "legendFormat": "p95"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(runmesh_step_attempt_duration_seconds_bucket{tool=~\"$tool\"}[$__rate_interval])))",
+          "range": true,
+          "instant": false,
+          "legendFormat": "p99"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 22
+      }
+    },
+    {
+      "id": 17,
+      "type": "row",
+      "title": "Failure codes, retries and lease expiries",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 30
+      }
+    },
+    {
+      "id": 18,
+      "type": "timeseries",
+      "title": "Failure codes",
+      "description": "sum by (code) (rate(runmesh_step_attempt_failures_total)) — attempts that carried an error, by code.\n\nThe sixteen runtime codes are a closed vocabulary; a code a TOOL invented is counted as `other`, which is the one genuinely open axis in this binary's whole label alphabet and exactly what `other` exists for. A rising `other` means go and read the tool's own error strings, not that something is broken.\n\nTIMEOUT and LEASE_LOST are the two that indict RunMesh rather than the tool: the first says the step outran its deadline, the second that the reconciler took the lease away while the worker still believed it held it.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "runmesh-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 40,
+            "showPoints": "never",
+            "spanNulls": false,
+            "pointSize": 5,
+            "gradientMode": "none",
+            "barAlignment": 0,
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (code) (rate(runmesh_step_attempt_failures_total{tool=~\"$tool\"}[$__rate_interval]))",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{code}}"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 31
+      }
+    },
+    {
+      "id": 19,
+      "type": "timeseries",
+      "title": "Why attempts stopped",
+      "description": "sum by (stop) (rate(runmesh_step_attempts_total{stop!=\"none\"})) — the engine's own classification of why an attempt ended early.\n\n`none` is filtered out because it is the overwhelming majority and would flatten everything else against the axis. timeout, cancel, lease_lost and shutdown are the four that are worth a graph, and shutdown appearing outside a deploy window is a process dying rather than draining.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "runmesh-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 40,
+            "showPoints": "never",
+            "spanNulls": false,
+            "pointSize": 5,
+            "gradientMode": "none",
+            "barAlignment": 0,
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (stop) (rate(runmesh_step_attempts_total{tool=~\"$tool\",stop!=\"none\"}[$__rate_interval]))",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{stop}}"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 31
+      }
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "Retries being scheduled",
+      "description": "sum by (tool) (rate(runmesh_step_attempts_total{state=\"RETRYING\"})) — attempts that failed and still had retry budget left.\n\nThis is the derived form of the counter this binary deliberately does not export separately. Compare it with the failure-code panel: retries tracking a specific code means one class of failure is being paid for over and over, and retries with no matching failure code is a contradiction worth investigating in the exporter itself.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "runmesh-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "pointSize": 5,
+            "gradientMode": "none",
+            "barAlignment": 0,
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (tool) (rate(runmesh_step_attempts_total{tool=~\"$tool\",state=\"RETRYING\"}[$__rate_interval]))",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{tool}}"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 39
+      }
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "Lease expiries",
+      "description": "sum by (new_state) (rate(runmesh_leases_expired_total)) — leases the reconciler reclaimed because a worker stopped heartbeating.\n\nThe label is the state the step was moved TO and it is the whole story: QUEUED means the step will be tried again, FAILED means its retry budget was already spent and the work is lost.\n\nAny sustained rate here is a real finding. It means workers are dying, or being starved of CPU long enough to miss RUNMESH_HEARTBEAT_INTERVAL, or the store is too slow to accept a heartbeat inside the lease TTL — and the first two look identical from here, which is what the goroutine and store panels are for.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "runmesh-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "pointSize": 5,
+            "gradientMode": "none",
+            "barAlignment": 0,
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (new_state) (rate(runmesh_leases_expired_total[$__rate_interval]))",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{new_state}}"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 39
+      }
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "Heartbeats by outcome",
+      "description": "sum by (outcome) (rate(runmesh_heartbeats_total)) — every heartbeat round trip and what the store answered.\n\n`ok` is the carrier wave: its rate should be roughly in-flight divided by the heartbeat interval, and a dip in it with no dip in in-flight is a store that has started refusing them. `lease_lost` here and a spike in the panel to the left are the same incident seen from the two ends.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "runmesh-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "pointSize": 5,
+            "gradientMode": "none",
+            "barAlignment": 0,
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (outcome) (rate(runmesh_heartbeats_total{tool=~\"$tool\"}[$__rate_interval]))",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{outcome}}"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 39
+      }
+    },
+    {
+      "id": 23,
+      "type": "row",
+      "title": "Worker pool saturation and the dispatcher",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 47
+      }
+    },
+    {
+      "id": 24,
+      "type": "timeseries",
+      "title": "Worker pool",
+      "description": "runmesh_workers, runmesh_workers_inflight and runmesh_workers_idle.\n\nIdle is NOT pool size minus in-flight, and the gap between them is the interesting window rather than an inconsistency. A capacity token is taken by the dispatcher when it DECIDES to claim and is not released until a worker takes the lease off the channel, so during the claim-to-hand-off window the pool has fewer idle tokens than it has free workers.\n\nWhich makes the arithmetic diagnostic: workers − inflight − idle is time spent inside Store.Claim, and a persistent gap there is a slow store masquerading as a busy pool.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "runmesh-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "pointSize": 5,
+            "gradientMode": "none",
+            "barAlignment": 0,
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0,
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "runmesh_workers",
+          "range": true,
+          "instant": false,
+          "legendFormat": "pool size"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "runmesh_workers_inflight",
+          "range": true,
+          "instant": false,
+          "legendFormat": "in flight"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "runmesh_workers_idle",
+          "range": true,
+          "instant": false,
+          "legendFormat": "idle tokens"
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "runmesh_workers - runmesh_workers_inflight - runmesh_workers_idle",
+          "range": true,
+          "instant": false,
+          "legendFormat": "held by an in-flight claim"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 48
+      }
+    },
+    {
+      "id": 25,
+      "type": "timeseries",
+      "title": "Hand-off wait percentiles",
+      "description": "runmesh_dispatch_handoff_seconds — from a step being claimed to a worker taking it off the lease channel.\n\nUnlabelled by design: pool saturation is a property of the pool and a per-tool cut would only ever be read summed back up.\n\nNear zero means the pool is keeping up. A rising p99 with a flat p50 is the classic saturation signature — most hand-offs are instant and the unlucky ones wait for a worker to free up — and it turns up here well before queue depth notices.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "runmesh-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "pointSize": 5,
+            "gradientMode": "none",
+            "barAlignment": 0,
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(runmesh_dispatch_handoff_seconds_bucket[$__rate_interval])))",
+          "range": true,
+          "instant": false,
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(runmesh_dispatch_handoff_seconds_bucket[$__rate_interval])))",
+          "range": true,
+          "instant": false,
+          "legendFormat": "p95"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(runmesh_dispatch_handoff_seconds_bucket[$__rate_interval])))",
+          "range": true,
+          "instant": false,
+          "legendFormat": "p99"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 48
+      }
+    },
+    {
+      "id": 26,
+      "type": "timeseries",
+      "title": "Claim fill ratio",
+      "description": "rate(runmesh_claim_leases_returned_total) / rate(runmesh_claim_leases_requested_total) — of the leases the dispatcher asked for, the fraction the store had.\n\nTwo counters rather than one gauge precisely so this ratio exists over time; a gauge would only ever show the last claim.\n\nFalling towards zero is a pool larger than the offered work, which is healthy and slightly wasteful. Pinned at 1 is a queue the pool cannot drain: every claim came back completely full, so there was more waiting.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "runmesh-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "pointSize": 5,
+            "gradientMode": "none",
+            "barAlignment": 0,
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "rate(runmesh_claim_leases_returned_total[$__rate_interval])\n/\n(rate(runmesh_claim_leases_requested_total[$__rate_interval]) > 0)",
+          "range": true,
+          "instant": false,
+          "legendFormat": "fill ratio"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 56
+      }
+    },
+    {
+      "id": 27,
+      "type": "timeseries",
+      "title": "Dispatcher wakeups",
+      "description": "sum by (on) (rate(runmesh_dispatcher_wakeups_total)) — what woke the dispatcher out of an idle park.\n\nThis is the panel that says whether Store.Ready() hints earn their keep. `hint` dominating means the notification path is carrying the work and latency is bounded by the store's willingness to speak up; `tick` dominating means the hint channel is carrying nothing and RUNMESH_POLL_INTERVAL is the entire latency story — at which case either the hints are broken or they were never worth the mechanism.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "runmesh-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "pointSize": 5,
+            "gradientMode": "none",
+            "barAlignment": 0,
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (on) (rate(runmesh_dispatcher_wakeups_total[$__rate_interval]))",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{on}}"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 56
+      }
+    },
+    {
+      "id": 28,
+      "type": "timeseries",
+      "title": "Claim round trips",
+      "description": "sum by (outcome) (rate(runmesh_claims_total)) and the p95 of runmesh_claim_duration_seconds on the same panel.\n\n`empty` is not a failure — it is the dispatcher asking an empty queue — and a high empty rate is only wasted work if the claim is also slow, which is why the duration line is here rather than on its own. `error` at any sustained rate is a store problem and should be read alongside engine.Stats()' own claim-error count, which the invariant tests hold equal to this series.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "runmesh-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "pointSize": 5,
+            "gradientMode": "none",
+            "barAlignment": 0,
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (outcome) (rate(runmesh_claims_total[$__rate_interval]))",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{outcome}}"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(runmesh_claim_duration_seconds_bucket[$__rate_interval])))",
+          "range": true,
+          "instant": false,
+          "legendFormat": "claim p95 (s)"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 56
+      }
+    },
+    {
+      "id": 29,
+      "type": "row",
+      "title": "Store",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 64
+      }
+    },
+    {
+      "id": 30,
+      "type": "timeseries",
+      "title": "Store operation p95 by op",
+      "description": "histogram_quantile(0.95, ...runmesh_store_operation_duration_seconds_bucket).\n\nMeasured by a decorator in cmd/server rather than by the stores themselves, which is why every store gets the same numbers on the same boundaries and why engine.Store never had to grow a method for it.\n\n`claim` and `finish` are the two that sit on the critical path; `queue_depth` is the expensive one and it is cached, so a spike there is one uncached recomputation every five seconds rather than every scrape.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "runmesh-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "pointSize": 5,
+            "gradientMode": "none",
+            "barAlignment": 0,
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (op, le) (rate(runmesh_store_operation_duration_seconds_bucket[$__rate_interval])))",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{op}}"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 65
+      }
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "Store errors",
+      "description": "sum by (op, kind) (rate(runmesh_store_operation_errors_total)) — store calls that returned an error, by operation and by which sentinel the error matched.\n\n`lease_lost` and `conflict` are ordinary in a system that reclaims leases: they are the store correctly refusing a write from a worker that no longer owns the step. `closed` during a drain is expected. Anything landing in `other` is an error the decorator could not classify, which means a new failure mode nobody has named yet.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "runmesh-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "pointSize": 5,
+            "gradientMode": "none",
+            "barAlignment": 0,
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (op, kind) (rate(runmesh_store_operation_errors_total[$__rate_interval]))",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{op}} · {{kind}}"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 65
+      }
+    },
+    {
+      "id": 32,
+      "type": "timeseries",
+      "title": "Reconciler sweeps",
+      "description": "sum by (outcome) (rate(runmesh_reconcile_sweeps_total)) with the p95 of runmesh_reconcile_duration_seconds.\n\nThe sweep rate should be a flat line at one over the reconcile interval — it is a ticker. A gap in it is a reconciler that stopped running, which shows up nowhere else until leases start expiring late.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "runmesh-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "pointSize": 5,
+            "gradientMode": "none",
+            "barAlignment": 0,
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (outcome) (rate(runmesh_reconcile_sweeps_total[$__rate_interval]))",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{outcome}}"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(runmesh_reconcile_duration_seconds_bucket[$__rate_interval])))",
+          "range": true,
+          "instant": false,
+          "legendFormat": "sweep p95 (s)"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 73
+      }
+    },
+    {
+      "id": 33,
+      "type": "timeseries",
+      "title": "Events dropped by slow subscribers",
+      "description": "rate(runmesh_store_events_dropped_total) — events the store could not hand to an in-process subscriber because that subscriber was behind.\n\nNon-zero is not a bug: both stores publish with a non-blocking send and drop rather than let an observer apply backpressure to execution, which is a stated rule of this codebase. What it DOES mean is that the live event stream is lossy for whoever was watching, and that this is why metrics are not fed from that stream.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "runmesh-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "pointSize": 5,
+            "gradientMode": "none",
+            "barAlignment": 0,
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "rate(runmesh_store_events_dropped_total[$__rate_interval])",
+          "range": true,
+          "instant": false,
+          "legendFormat": "dropped/s"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 73
+      }
+    },
+    {
+      "id": 34,
+      "type": "row",
+      "title": "HTTP surface",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 81
+      }
+    },
+    {
+      "id": 35,
+      "type": "timeseries",
+      "title": "Requests by route",
+      "description": "sum by (route) (rate(runmesh_http_requests_total)).\n\nThe label is the matched ROUTE PATTERN — 'GET /api/v1/jobs/{id}', method included, because routeOf() already returns it that way — so job ids never become label values and this series count cannot grow with traffic. A request the mux did not route is `unmatched`, which gets its own cell so a 404 flood stays out of the per-route series.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "runmesh-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 40,
+            "showPoints": "never",
+            "spanNulls": false,
+            "pointSize": 5,
+            "gradientMode": "none",
+            "barAlignment": 0,
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (route) (rate(runmesh_http_requests_total[$__rate_interval]))",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{route}}"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 82
+      }
+    },
+    {
+      "id": 36,
+      "type": "timeseries",
+      "title": "Responses by status",
+      "description": "sum by (status) (rate(runmesh_http_requests_total)).\n\n401 and 403 are worth watching for their own sake: this API's whole authorisation story is scopes on an API key, and a rising 403 is usually a key issued with one scope short rather than an attack.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "runmesh-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 40,
+            "showPoints": "never",
+            "spanNulls": false,
+            "pointSize": 5,
+            "gradientMode": "none",
+            "barAlignment": 0,
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (status) (rate(runmesh_http_requests_total[$__rate_interval]))",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{status}}"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 82
+      }
+    },
+    {
+      "id": 37,
+      "type": "timeseries",
+      "title": "Request duration p95 by route",
+      "description": "histogram_quantile(0.95, ...runmesh_http_request_duration_seconds_bucket).\n\nSTREAMING ROUTES ARE ABSENT FROM THIS PANEL AND THAT IS CORRECT. The elapsed time this histogram is fed comes from the logging middleware's deferred function, which runs when the handler RETURNS — and an event-stream handler returns when somebody closes a browser tab. One open dashboard would drop an hour-long observation into the same histogram as a four-millisecond readiness probe and move the p99 of the entire API. The exporter excludes them; their count is the 'Open event streams' panel instead.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "runmesh-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "pointSize": 5,
+            "gradientMode": "none",
+            "barAlignment": 0,
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (route, le) (rate(runmesh_http_request_duration_seconds_bucket[$__rate_interval])))",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{route}}"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 90
+      }
+    },
+    {
+      "id": 38,
+      "type": "timeseries",
+      "title": "Response bytes by route",
+      "description": "sum by (route) (rate(runmesh_http_response_bytes_total)) — body bytes written per second.\n\nThe route that dominates here is normally the job listing, and a step change in it usually means somebody started polling a large page rather than subscribing to the stream.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "runmesh-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "pointSize": 5,
+            "gradientMode": "none",
+            "barAlignment": 0,
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (route) (rate(runmesh_http_response_bytes_total[$__rate_interval]))",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{route}}"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 90
+      }
+    },
+    {
+      "id": 39,
+      "type": "timeseries",
+      "title": "Open event streams",
+      "description": "runmesh_http_streams_active — event-stream connections held open right now.\n\nThe companion to the duration histogram's deliberate blind spot. A stream is not a slow request, it is a held connection, and those are different quantities that want different instruments. Compare it with RUNMESH_STREAM_MAX: at the ceiling, new subscribers are being refused.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "runmesh-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "pointSize": 5,
+            "gradientMode": "none",
+            "barAlignment": 0,
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0,
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "runmesh_http_streams_active",
+          "range": true,
+          "instant": false,
+          "legendFormat": "open streams"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 90
+      }
+    },
+    {
+      "id": 40,
+      "type": "row",
+      "title": "Go runtime — RunMesh's own metric names, not client_golang's",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 98
+      },
+      "description": "This binary hand-rolls its Prometheus exposition (ADR 0012), so there is no go_memstats_* family, no go_info, and no process_cpu_seconds_total, process_resident_memory_bytes or process_open_fds. An off-the-shelf 'Go Processes' dashboard renders empty against it — which is precisely why this file exists."
+    },
+    {
+      "id": 41,
+      "type": "timeseries",
+      "title": "Goroutines against the engine's declared census",
+      "description": "go_goroutines, with the census the engine's package doc FIXES at 2 + workers + one per in-flight step drawn beside it.\n\nThis is not background colour: it is a live assertion of a stated design invariant. The second line is the floor, not an equality — net/http keeps its own goroutines, one per connection — so what matters is the SHAPE. The two should move together. go_goroutines climbing while the census line is flat is a leak, and the fact that the engine names its own budget is what turns 'goroutines are up' into a specific place to look.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "runmesh-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "pointSize": 5,
+            "gradientMode": "none",
+            "barAlignment": 0,
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0,
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "go_goroutines",
+          "range": true,
+          "instant": false,
+          "legendFormat": "go_goroutines"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "runmesh_workers + runmesh_workers_inflight + 2",
+          "range": true,
+          "instant": false,
+          "legendFormat": "engine census (floor)"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 99
+      }
+    },
+    {
+      "id": 42,
+      "type": "timeseries",
+      "title": "Go memory",
+      "description": "go_memory_heap_objects_bytes and go_memory_total_bytes.\n\nNEITHER OF THESE IS RSS. go_memory_total_bytes is everything the Go runtime has mapped for all purposes, which is an upper bound the operating system may never have made resident. The exporter refuses to publish a series named process_resident_memory_bytes rather than approximate it from here, because a series named after something it is not produces a confident wrong answer where an absent one produces an honest blank panel. Under Kubernetes, cAdvisor's container_memory_working_set_bytes is the real number and is what to alert on.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "runmesh-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "pointSize": 5,
+            "gradientMode": "none",
+            "barAlignment": 0,
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "go_memory_heap_objects_bytes",
+          "range": true,
+          "instant": false,
+          "legendFormat": "live heap objects"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "go_memory_total_bytes",
+          "range": true,
+          "instant": false,
+          "legendFormat": "runtime mapped (not RSS)"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 99
+      }
+    },
+    {
+      "id": 43,
+      "type": "timeseries",
+      "title": "Garbage collection",
+      "description": "rate(go_gc_cycles_total) and rate(go_cpu_gc_seconds_total).\n\nThe second line is CPU-seconds per second summed over all cores, so on an 8-core box 0.08 is one percent of the machine. GC CPU rising alongside engine overhead in the attempt-duration section is one of the few ways this process gets slower without any single operation getting slower.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "runmesh-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "pointSize": 5,
+            "gradientMode": "none",
+            "barAlignment": 0,
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "rate(go_gc_cycles_total[$__rate_interval])",
+          "range": true,
+          "instant": false,
+          "legendFormat": "gc cycles/s"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "rate(go_cpu_gc_seconds_total[$__rate_interval])",
+          "range": true,
+          "instant": false,
+          "legendFormat": "gc cpu-seconds/s"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 99
+      }
+    },
+    {
+      "id": 44,
+      "type": "timeseries",
+      "title": "Scheduler latency",
+      "description": "histogram_quantile over go_sched_latencies_seconds_bucket — time goroutines spent runnable before actually running.\n\nRe-bucketed from Go's own histogram onto seven boundaries rather than passed through: Go publishes it with fifty to two hundred buckets and exporting those verbatim would add that many series for a metric almost nobody queries at that resolution. client_golang re-buckets it for the same reason.\n\nA p99 climbing into the tens of milliseconds is CPU starvation, and it is the explanation to reach for when heartbeats start being missed on a box that is not obviously busy — the buckets and the count are exact; only _sum is an estimate, so trust the quantiles and not an average.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "runmesh-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "pointSize": 5,
+            "gradientMode": "none",
+            "barAlignment": 0,
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(go_sched_latencies_seconds_bucket[$__rate_interval])))",
+          "range": true,
+          "instant": false,
+          "legendFormat": "p99"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(go_sched_latencies_seconds_bucket[$__rate_interval])))",
+          "range": true,
+          "instant": false,
+          "legendFormat": "p50"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 107
+      }
+    },
+    {
+      "id": 45,
+      "type": "timeseries",
+      "title": "Heap allocation rate",
+      "description": "rate(go_gc_heap_allocs_bytes_total) — bytes allocated on the heap per second.\n\nThe cause of which the GC panel beside it is the effect: Go collects when allocation says it must, so a step change here is what a step change in GC cycles is explained BY. It is also the most sensitive detector of an allocation regression on a hot path — the engine's observer contract requires the settle path to allocate nothing, and a change in this gradient with throughput flat is that promise being broken.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "runmesh-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "pointSize": 5,
+            "gradientMode": "none",
+            "barAlignment": 0,
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "rate(go_gc_heap_allocs_bytes_total[$__rate_interval])",
+          "range": true,
+          "instant": false,
+          "legendFormat": "allocated/s"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 107
+      }
+    },
+    {
+      "id": 46,
+      "type": "timeseries",
+      "title": "Exporter health",
+      "description": "runmesh_metrics_scrape_duration_seconds p99, and rate(runmesh_metrics_label_rejected_total) by metric.\n\nThe second series is the cardinality interlock made visible. Every label vocabulary in this binary is closed at wiring time, and a value outside its declared set resolves to a shared `other` child and bumps this counter — so the failure mode of a cardinality mistake is a line on this panel rather than an exporter that eats the machine. Any non-zero rate names the metric whose vocabulary is wrong.\n\nThe duration is the PREVIOUS scrape's render time, which is the only one a scrape can report about itself.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "runmesh-prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "pointSize": 5,
+            "gradientMode": "none",
+            "barAlignment": 0,
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(runmesh_metrics_scrape_duration_seconds_bucket[$__rate_interval])))",
+          "range": true,
+          "instant": false,
+          "legendFormat": "render p99 (s)"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "runmesh-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (metric) (rate(runmesh_metrics_label_rejected_total[$__rate_interval]))",
+          "range": true,
+          "instant": false,
+          "legendFormat": "rejected: {{metric}}"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 107
+      }
+    }
+  ]
+}

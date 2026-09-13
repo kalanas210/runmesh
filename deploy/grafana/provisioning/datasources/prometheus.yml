@@ -1,0 +1,33 @@
+# The one datasource, provisioned so nobody ever clicks through Add data
+# source and so the UID below is a constant the dashboard JSON can name.
+#
+# THAT UID IS THE LOAD-BEARING PART. A datasource created by hand gets a random
+# UID, and a dashboard that references a random UID is a dashboard that shows
+# "Datasource <uid> was not found" on every panel the first time somebody
+# imports it somewhere else. Pinning it here and referencing the same literal
+# in deploy/grafana/dashboards/runmesh.json is what makes the pair portable.
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: runmesh-prometheus
+    type: prometheus
+    access: proxy
+    # The compose service name, because Grafana and Prometheus ARE both compose
+    # services and share the default project network — unlike the RunMesh
+    # server itself, which is why prometheus.yml has to say
+    # host.docker.internal and this file does not.
+    url: http://prometheus:9090
+    isDefault: true
+    # Deleted and rewritten from this file on every start, so an edit made in
+    # the UI never becomes the thing that keeps a colleague's checkout working.
+    editable: false
+    jsonData:
+      # Must match global.scrape_interval in deploy/prometheus/prometheus.yml.
+      # Grafana uses it as the floor for $__rate_interval, and a value that is
+      # too low there produces rate() windows narrower than two scrapes — which
+      # renders as a graph full of gaps that looks exactly like an unstable
+      # exporter.
+      timeInterval: 15s
+      httpMethod: POST

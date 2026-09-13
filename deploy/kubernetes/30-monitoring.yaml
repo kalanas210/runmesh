@@ -1,0 +1,124 @@
+# How Prometheus reaches GET /api/v1/metrics.
+#
+#   kubectl apply -f deploy/kubernetes/30-monitoring.yaml
+#
+# THERE IS DELIBERATELY NO NetworkPolicy IN THIS FILE, and that is not an
+# oversight. internal/k8s/sandbox_test.go reads EVERY *.yaml in this directory,
+# keeps every document whose kind is NetworkPolicy, and then asserts three
+# things over the result: every policy lives in namespace runmesh-tasks, every
+# podSelector is either empty or exactly runmesh.io/network=allow, and NO policy
+# anywhere has an Ingress rule. A monitoring policy is by definition an ingress
+# policy in the runmesh namespace, so it would fail all three — and those
+# assertions are the sandbox's proof, not a formality. If a scrape policy is
+# ever genuinely needed it goes in a SUBDIRECTORY (the loader skips directories)
+# or those tests are widened deliberately, with an argument. It is never
+# quietly relaxed.
+#
+# A related trap worth knowing about: the loader's per-file decode loop breaks
+# on the first document it cannot unmarshal, so a NetworkPolicy placed AFTER
+# another document in the same file can be silently skipped — a policy that
+# appears to be applied while the test that guards it never sees it. Keep
+# NetworkPolicies in their own file, first.
+#
+# SCRAPING IS AUTHENTICATED. GET /api/v1/metrics carries the metrics.read scope
+# (see ADR 0012 and internal/config/scopes.go): the probes are public because a
+# load balancer often cannot hold a credential, and Prometheus can — it has an
+# `authorization` stanza and a `credentials_file` in scrape_configs, and the
+# ServiceMonitor below uses the Secret form of the same thing. An
+# unauthenticated /metrics would hand queue depth, job counts, worker counts and
+# per-tool failure codes to anything that can reach the port.
+#
+# Issue the scrape key with that scope and nothing else:
+#
+#   RUNMESH_API_KEYS=prom:metrics.read=$(openssl rand -hex 32)
+#   kubectl -n runmesh create secret generic runmesh-scrape-credentials \
+#       --from-literal=token=<the same key>
+#
+# The Service below selects the control-plane Deployment by the two labels every
+# object in this repository carries. That Deployment is not in this directory
+# yet — the control plane still runs with `go run ./cmd/server` against a
+# cluster, and only the task-side RBAC and NetworkPolicy are deployed — so this
+# manifest is the scrape wiring waiting for it, and the selector is the contract
+# it will have to satisfy.
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: runmesh-metrics
+  namespace: runmesh
+  labels:
+    app.kubernetes.io/name: runmesh
+    app.kubernetes.io/component: control-plane
+  annotations:
+    # The annotation form, for a Prometheus configured with the classic
+    # kubernetes_sd_configs + relabel rules rather than the Operator. It is
+    # harmless when the Operator is in use and the ServiceMonitor below is what
+    # actually takes effect; both are here because which one a cluster runs is
+    # not something this repository gets to decide.
+    #
+    # Note that an annotation-driven Prometheus has no way to attach a
+    # credential, so on that path the scrape will get a 401 until the scrape job
+    # is given an authorization stanza by hand. That is the honest cost of
+    # scoping the endpoint, and it is the right side of the trade.
+    prometheus.io/scrape: "true"
+    prometheus.io/path: /api/v1/metrics
+    prometheus.io/port: "8080"
+spec:
+  # Headless: Prometheus wants one target per pod, not one target behind a
+  # load-balanced ClusterIP. A ClusterIP here would scrape a randomly chosen
+  # replica each interval, and every per-process counter — go_goroutines,
+  # runmesh_workers, every _total — would look like it was resetting at random.
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: runmesh
+    app.kubernetes.io/component: control-plane
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      protocol: TCP
+---
+# The Prometheus Operator form. Applying this to a cluster without the Operator
+# fails with "no matches for kind ServiceMonitor", which is a loud, correct
+# failure: apply the Service alone there.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: runmesh
+  namespace: runmesh
+  labels:
+    app.kubernetes.io/name: runmesh
+    app.kubernetes.io/component: control-plane
+spec:
+  namespaceSelector:
+    matchNames:
+      - runmesh
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: runmesh
+      app.kubernetes.io/component: control-plane
+  endpoints:
+    - port: http
+      path: /api/v1/metrics
+      # Fifteen seconds, deliberately not one. runmesh_queue_depth is the one
+      # expensive reading in the whole exposition — against the in-memory store
+      # it walks every job times every step under the mutex that also serialises
+      # Claim and Finish, and against PostgreSQL it is a count(*) over two
+      # correlated NOT EXISTS subqueries. The exporter caches it for five
+      # seconds (internal/metrics/gauges.go), which makes this interval safe and
+      # makes a one-second interval pointless rather than dangerous. Note that
+      # GET /api/v1/ready pays the UNCACHED cost on every probe, so a tight
+      # readiness probe plus a tight scrape is the combination that hurts.
+      interval: 15s
+      scrapeTimeout: 10s
+      scheme: http
+      authorization:
+        type: Bearer
+        credentials:
+          name: runmesh-scrape-credentials
+          key: token
+      relabelings:
+        # Keep the pod name as `instance`, so a counter reset is attributable to
+        # one restarted replica rather than looking like a fleet-wide anomaly.
+        - sourceLabels: [__meta_kubernetes_pod_name]
+          targetLabel: instance

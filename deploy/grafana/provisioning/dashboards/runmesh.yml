@@ -1,0 +1,23 @@
+# The dashboard provider: where on disk Grafana looks for dashboard JSON.
+#
+# foldersFromFilesStructure is off and the folder is empty on purpose — there
+# is one dashboard, and burying it one click deep so that the home page shows
+# an empty folder helps nobody.
+
+apiVersion: 1
+
+providers:
+  - name: runmesh
+    type: file
+    # Read-only in the UI. A dashboard saved from the browser would live in
+    # Grafana's sqlite, survive exactly as long as the volume does, and then
+    # silently diverge from the file every other developer has. Editing the
+    # JSON is the supported path; "Save dashboard" is not.
+    allowUiUpdates: false
+    # Removes the dashboard from Grafana when the file goes away, so a renamed
+    # or deleted JSON does not leave an orphan that nobody can find the source
+    # for.
+    disableDeletion: false
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

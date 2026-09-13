@@ -1,0 +1,87 @@
+# Prometheus, pointed at a RunMesh running on the developer's own machine.
+#
+#   make monitoring-up        (or: ./task.ps1 monitoring-up)
+#   go run ./cmd/server
+#   open http://127.0.0.1:9090/targets
+#
+# THE SCRAPE IS AUTHENTICATED, and the credential is a FILE rather than a
+# string in this document. GET /api/v1/metrics carries the metrics.read scope
+# (internal/config/scopes.go, argued in ADR 0012): the health and readiness
+# probes are public because a load balancer often cannot hold a credential,
+# and that justification simply does not extend to Prometheus, which has an
+# `authorization` stanza and has had `credentials_file` since 2.26. An
+# unauthenticated /metrics would hand queue depth, job counts, worker counts
+# and per-tool failure codes to anything that can reach the port.
+#
+# `credentials_file` rather than `credentials` is not a style preference. A
+# token inline here is a token in every `git log -p`, in every copy of this
+# file an operator pastes into a ticket, and in the output of Prometheus's own
+# /api/v1/status/config endpoint — which is unauthenticated by default and
+# redacts `credentials` while it cannot redact a file it has not read. The file
+# is read fresh on each scrape, so rotating the key is `echo > the file`, not a
+# restart.
+#
+# The shipped deploy/prometheus/scrape-token.example holds the same throwaway
+# key .env.example ships, so the whole stack works from a clean clone. It is NOT
+# a secret, and the `.example` suffix is what keeps it from becoming one: the
+# obvious place for a real key is deploy/prometheus/scrape-token, and that exact
+# path is in .gitignore, so a key pasted there cannot be committed by accident.
+# Either drop a file at that path, or point RUNMESH_SCRAPE_TOKEN_FILE anywhere
+# else — both override the mount without editing anything tracked.
+
+global:
+  # Fifteen seconds, deliberately not one. runmesh_queue_depth is the one
+  # expensive reading in the exposition — against the in-memory store it walks
+  # every job times every step under the mutex that also serialises Claim and
+  # Finish, and against PostgreSQL it is a count(*) over two correlated NOT
+  # EXISTS subqueries. The exporter caches it for five seconds
+  # (internal/metrics/gauges.go), which makes this interval safe and makes a
+  # one-second interval pointless rather than dangerous. Note that
+  # GET /api/v1/ready pays the UNCACHED cost on every probe: a tight readiness
+  # probe plus a tight scrape is the combination that actually hurts.
+  scrape_interval: 15s
+
+  # Shorter than the interval on purpose. A scrape that has not finished by the
+  # time the next one is due does not queue — it is abandoned and the series
+  # gets a stale marker — so a timeout at or above the interval turns a slow
+  # exporter into a gap rather than into a slow sample.
+  scrape_timeout: 10s
+
+  external_labels:
+    # Stamped so a dashboard screenshot from a laptop is never mistaken for one
+    # from a cluster. The Kubernetes path (deploy/kubernetes/30-monitoring.yaml)
+    # sets its own.
+    deployment: local-compose
+
+scrape_configs:
+  - job_name: runmesh
+    metrics_path: /api/v1/metrics
+    scheme: http
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/scrape-token
+    static_configs:
+      # host.docker.internal, NOT a compose service name, because RunMesh is
+      # not a compose service: docker-compose.yml runs only the database, and
+      # the server runs on the host with `go run ./cmd/server`. Docker Desktop
+      # resolves this name natively; on Linux the `extra_hosts: host-gateway`
+      # line in docker-compose.yml is what creates it.
+      #
+      # The consequence worth stating: with no server running, this target is
+      # DOWN and `up{job="runmesh"}` is 0. That is the correct reading, and it
+      # is also the first thing to check when every dashboard panel is empty.
+      - targets:
+          - "host.docker.internal:8080"
+        labels:
+          # Overridden so the series does not carry a name that means something
+          # different inside the container than it does in the browser bar.
+          instance: "127.0.0.1:8080"
+
+  # Prometheus scraping itself. It costs almost nothing and it separates two
+  # failure modes that look identical from a blank dashboard: "the stack is
+  # down" and "the stack is up and RunMesh is not running". If prometheus_*
+  # series exist and runmesh_* ones do not, the server is what is missing.
+  - job_name: prometheus
+    static_configs:
+      - targets:
+          - "localhost:9090"

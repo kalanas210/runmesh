@@ -55,3 +55,9 @@ CLAUDE.local.md
 transcripts/
 scratchpad/
 .scratch/
+
+# The Prometheus scrape credential. deploy/prometheus/scrape-token.example is
+# tracked and holds a throwaway key so a clean clone comes up working; this is
+# the path an operator naturally drops a REAL key into, so it is ignored rather
+# than left as a tracked file somebody edits in place and commits.
+deploy/prometheus/scrape-token
