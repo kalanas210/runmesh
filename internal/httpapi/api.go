@@ -14,6 +14,8 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/kalanas210/runmesh/internal/clock"
 	"github.com/kalanas210/runmesh/internal/config"
@@ -71,6 +73,32 @@ type Deps struct {
 	// server does not do that" and "you got the URL wrong" is worth a status
 	// code.
 	Planner Planner
+
+	// Gatherer renders GET /api/v1/metrics. Optional, on the same terms as
+	// Planner: nil answers 501 rather than 404.
+	Gatherer Gatherer
+
+	// Stream is the live event accelerator. Optional, and a nil one is
+	// defaulted to a no-op rather than refused, because correctness does not
+	// depend on it: GET /api/v1/jobs/{id}/stream serves the whole timeline from
+	// the durable store on its poll ticker either way, and the bus only shortens
+	// the wait. A deployment without one degrades to poll-speed, which is the
+	// right failure mode for an accelerator.
+	Stream Streamer
+
+	// The streaming knobs, all five loaded from the environment in
+	// cmd/server/run.go. Each is defaulted here to the same value config.Load
+	// defaults it to, so a test that constructs an API without mentioning any of
+	// them gets the shipped behaviour rather than a zero-valued ticker panic.
+	StreamMax          int
+	StreamBuffer       int
+	StreamHeartbeat    time.Duration
+	StreamPollInterval time.Duration
+	StreamWriteTimeout time.Duration
+	// Metrics receives one call per finished request, from inside the log
+	// line's own deferred func. Optional and nil-safe, so a test that builds an
+	// API without telemetry composes exactly as it did before.
+	Metrics HTTPObserver
 }
 
 // Planner is the slice of internal/planner the API needs, declared here as an
@@ -78,6 +106,26 @@ type Deps struct {
 // planner package for its Goal and Trace types, and nothing else.
 type Planner interface {
 	Plan(ctx context.Context, goal planner.Goal) (planner.Result, error)
+}
+
+// Streamer is the live event source, declared here as the narrowest slice the
+// API needs — one method — so httpapi never imports internal/eventbus and the
+// two packages stay independently testable. It is the same consumer-declared
+// pattern as Runtime, Policy and Planner above.
+//
+// It is deliberately NOT added to Store. The stream handler reads its history
+// through Store.Job and Store.JobEvents, which that interface already has;
+// live push is a different concern with a different failure mode (lossy by
+// design, process-local, optional) and folding it into the persistence
+// interface would make every store implementation and every test double
+// responsible for it.
+type Streamer interface {
+	// Subscribe returns this job's live events and the function that ends the
+	// subscription. Delivery is lossy under backpressure by contract: a full
+	// buffer drops rather than blocking, because a dashboard must never be able
+	// to slow down execution. The caller detects a drop from the gap-free
+	// per-job Seq and repairs it from the durable timeline.
+	Subscribe(jobID string, buf int) (<-chan runmesh.Event, func())
 }
 
 // Policy is the slice of the execution policy the API needs. Declared here as
@@ -103,10 +151,24 @@ type API struct {
 	defaults      runmesh.Defaults
 	policy        Policy
 	planner       Planner
+	gatherer      Gatherer
 	executionMode tools.ExecutionMode
 	maxQueueDepth int
 	durable       bool
 	storeName     string
+
+	// The live stream and its budget. streams is the admission counter: an
+	// open SSE connection costs a goroutine, a store subscription and a socket
+	// for as long as a dashboard is left open, so the number of them is capped
+	// and the cap is answered with the same 429 the queue-full path already
+	// produces rather than with a status invented for this route.
+	stream             Streamer
+	maxStreams         int
+	streamBuffer       int
+	streamHeartbeat    time.Duration
+	streamPollInterval time.Duration
+	streamWriteTimeout time.Duration
+	streams            atomic.Int64
 
 	// draining is set by Draining() so that readiness fails as soon as
 	// shutdown begins, giving a load balancer time to take this instance out
@@ -137,6 +199,27 @@ func New(d Deps) (http.Handler, *API, error) {
 	if d.ExecutionMode == "" {
 		d.ExecutionMode = tools.ModeInProcess
 	}
+	// A nil Streamer becomes a no-op rather than an error, exactly as a nil
+	// Sandbox does above: the stream route still works, it just waits for the
+	// poll ticker instead of being woken by the bus.
+	if d.Stream == nil {
+		d.Stream = noStreamer{}
+	}
+	if d.StreamMax < 1 {
+		d.StreamMax = 64
+	}
+	if d.StreamBuffer < 1 {
+		d.StreamBuffer = 256
+	}
+	if d.StreamHeartbeat <= 0 {
+		d.StreamHeartbeat = 15 * time.Second
+	}
+	if d.StreamPollInterval <= 0 {
+		d.StreamPollInterval = time.Second
+	}
+	if d.StreamWriteTimeout <= 0 {
+		d.StreamWriteTimeout = 10 * time.Second
+	}
 
 	a := &API{
 		store:         d.Store,
@@ -148,11 +231,19 @@ func New(d Deps) (http.Handler, *API, error) {
 		defaults:      d.Defaults,
 		policy:        d.Sandbox,
 		planner:       d.Planner,
+		gatherer:      d.Gatherer,
 		executionMode: d.ExecutionMode,
 		maxQueueDepth: d.MaxQueueDepth,
 		durable:       d.Durable,
 		storeName:     d.StoreName,
 		draining:      make(chan struct{}),
+
+		stream:             d.Stream,
+		maxStreams:         d.StreamMax,
+		streamBuffer:       d.StreamBuffer,
+		streamHeartbeat:    d.StreamHeartbeat,
+		streamPollInterval: d.StreamPollInterval,
+		streamWriteTimeout: d.StreamWriteTimeout,
 	}
 
 	mux := http.NewServeMux()
@@ -174,7 +265,7 @@ func New(d Deps) (http.Handler, *API, error) {
 	// turned into a 500 and THEN logged with that status.
 	handler := chain(mux,
 		RequestID(a.clock),
-		Logger(a.log, a.clock),
+		Logger(a.log, a.clock, d.Metrics),
 		Recover(a.log),
 		BodyLimit(d.MaxRequestBytes),
 		Auth(d.APIKeys, a.log, func(r *http.Request) bool { return public[r.URL.Path] }),
@@ -210,6 +301,14 @@ func (a *API) routes() []route {
 		// submits should not be able to halt the fleet.
 		{"POST /api/v1/jobs/{id}/cancel", config.ScopeJobsCancel, a.cancelJob},
 		{"GET /api/v1/jobs/{id}/events", config.ScopeJobsRead, a.jobEvents},
+
+		// The live timeline. jobs.read and nothing more: it is the same data
+		// GET /api/v1/jobs/{id}/events returns, arriving sooner, and a scope
+		// that differed from the polling endpoint's would mean a key could read
+		// a job's history but not watch it happen — a distinction nobody wants
+		// to administer. See ADR 0013 for why this is SSE and not a WebSocket.
+		{streamRoute, config.ScopeJobsRead, a.jobStream},
+
 		{"GET /api/v1/tools", config.ScopeJobsRead, a.listTools},
 
 		// The planning endpoints. Both require jobs.write, including the dry
@@ -217,6 +316,28 @@ func (a *API) routes() []route {
 		// capability that costs money is a write however little it changes.
 		{"POST /api/v1/plans", config.ScopeJobsWrite, a.createPlan},
 		{"POST /api/v1/goals", config.ScopeJobsWrite, a.createGoal},
+
+		// Metrics is SCOPED, not public, and it is under /api/v1 like
+		// everything else here.
+		//
+		// Scoped, because the justification written two entries below — a load
+		// balancer often cannot hold a credential — does not extend to
+		// Prometheus, which has an authorization stanza and a credentials_file
+		// in scrape_configs. An unauthenticated /metrics exports queue depth,
+		// job counts, worker counts and per-tool failure codes to anyone who can
+		// reach the port: free reconnaissance, and the only endpoint here that
+		// would hand it over.
+		//
+		// Its own scope rather than jobs.read, because a scrape token that can
+		// also list every job and read every event body — tool results
+		// included — is a much larger grant than the one Prometheus needs; see
+		// config.ScopeMetricsRead.
+		//
+		// Versioned, because every route in this table is, and because the auth
+		// exemption is exact-path: an unversioned /metrics would be the only
+		// path in the process whose shape says nothing about which API it
+		// belongs to.
+		{"GET /api/v1/metrics", config.ScopeMetricsRead, a.metrics},
 
 		// The probes carry no credential: a load balancer must be able to ask
 		// whether this process is alive and ready without holding one.

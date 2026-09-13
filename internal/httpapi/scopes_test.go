@@ -25,6 +25,10 @@ func scopedFixture(t *testing.T, scopes ...config.Scope) *fixture {
 		// scope allows it. Without one they would answer 501 for every scope,
 		// and the matrix would report green for a route it never exercised.
 		d.Planner = &stubPlanner{result: sampleResult()}
+		// A gatherer, for exactly the same reason: a nil one makes
+		// GET /api/v1/metrics answer 501 whatever scope is held, which is a
+		// green row that proves nothing.
+		d.Gatherer = stubGatherer("# HELP up 1\n")
 	})
 }
 
@@ -52,6 +56,12 @@ func TestScopeMatrix(t *testing.T) {
 		{"list", http.MethodGet, "/api/v1/jobs", "", config.ScopeJobsRead},
 		{"get", http.MethodGet, "/api/v1/jobs/job_missing", "", config.ScopeJobsRead},
 		{"events", http.MethodGet, "/api/v1/jobs/job_missing/events", "", config.ScopeJobsRead},
+		// The live timeline carries exactly what the polling endpoint above
+		// carries, so it demands exactly the same scope. The target names a job
+		// that does not exist deliberately: the handler answers 404 before it
+		// opens a stream, so this cell is a synchronous request like every other
+		// one in the matrix and the recorder-based fixture can drive it.
+		{"stream", http.MethodGet, "/api/v1/jobs/job_missing/stream", "", config.ScopeJobsRead},
 		{"cancel", http.MethodPost, "/api/v1/jobs/job_missing/cancel", "", config.ScopeJobsCancel},
 		{"tools", http.MethodGet, "/api/v1/tools", "", config.ScopeJobsRead},
 		// Both planning routes need jobs.write, the dry run included: it
@@ -59,6 +69,10 @@ func TestScopeMatrix(t *testing.T) {
 		// costs money is a write however little it changes.
 		{"plan", http.MethodPost, "/api/v1/plans", `{"goal":"x"}`, config.ScopeJobsWrite},
 		{"goal", http.MethodPost, "/api/v1/goals", `{"goal":"x"}`, config.ScopeJobsWrite},
+		// Scraping is its own authority: reading aggregate counters and reading
+		// every job payload with its tool results are different grants, by the
+		// same argument that split jobs.cancel out of jobs.write.
+		{"metrics", http.MethodGet, "/api/v1/metrics", "", config.ScopeMetricsRead},
 	}
 
 	for _, c := range calls {

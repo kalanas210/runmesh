@@ -1,0 +1,45 @@
+# HELP runmesh_boots_total Times this process started.
+# TYPE runmesh_boots_total counter
+runmesh_boots_total 3
+# HELP runmesh_events_dropped_total Dropped events.
+# TYPE runmesh_events_dropped_total counter
+runmesh_events_dropped_total 1
+# HELP runmesh_metrics_label_rejected_total Label values rejected because they were outside the metric's declared vocabulary, by metric.
+# TYPE runmesh_metrics_label_rejected_total counter
+runmesh_metrics_label_rejected_total{metric="runmesh_outcomes_total"} 0
+runmesh_metrics_label_rejected_total{metric="runmesh_step_seconds"} 0
+# HELP runmesh_metrics_scrape_duration_seconds Time spent rendering the exposition body, as measured by the PREVIOUS scrape.
+# TYPE runmesh_metrics_scrape_duration_seconds histogram
+runmesh_metrics_scrape_duration_seconds_bucket{le="0.001"} 0
+runmesh_metrics_scrape_duration_seconds_bucket{le="0.005"} 0
+runmesh_metrics_scrape_duration_seconds_bucket{le="0.01"} 0
+runmesh_metrics_scrape_duration_seconds_bucket{le="0.025"} 0
+runmesh_metrics_scrape_duration_seconds_bucket{le="0.05"} 0
+runmesh_metrics_scrape_duration_seconds_bucket{le="0.1"} 0
+runmesh_metrics_scrape_duration_seconds_bucket{le="0.25"} 0
+runmesh_metrics_scrape_duration_seconds_bucket{le="0.5"} 0
+runmesh_metrics_scrape_duration_seconds_bucket{le="1"} 0
+runmesh_metrics_scrape_duration_seconds_bucket{le="2.5"} 0
+runmesh_metrics_scrape_duration_seconds_bucket{le="5"} 0
+runmesh_metrics_scrape_duration_seconds_bucket{le="+Inf"} 0
+runmesh_metrics_scrape_duration_seconds_sum 0
+runmesh_metrics_scrape_duration_seconds_count 0
+# HELP runmesh_outcomes_total Outcomes, by tool. Backslash \\ and "quote" survive a help line unescaped-ish.
+# TYPE runmesh_outcomes_total counter
+runmesh_outcomes_total{tool="echo"} 9
+runmesh_outcomes_total{tool="report_generate"} 1
+# HELP runmesh_queue_depth Claimable steps.
+# TYPE runmesh_queue_depth gauge
+runmesh_queue_depth 12
+# HELP runmesh_step_seconds Step duration.
+# TYPE runmesh_step_seconds histogram
+runmesh_step_seconds_bucket{tool="echo",le="0.005"} 1
+runmesh_step_seconds_bucket{tool="echo",le="0.1"} 1
+runmesh_step_seconds_bucket{tool="echo",le="2.5"} 2
+runmesh_step_seconds_bucket{tool="echo",le="600"} 3
+runmesh_step_seconds_bucket{tool="echo",le="+Inf"} 4
+runmesh_step_seconds_sum{tool="echo"} 10002.204
+runmesh_step_seconds_count{tool="echo"} 4
+# HELP runmesh_workers Configured worker pool size.
+# TYPE runmesh_workers gauge
+runmesh_workers 8

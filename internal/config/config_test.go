@@ -2,6 +2,9 @@ package config_test
 
 import (
 	"log/slog"
+	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -223,6 +226,46 @@ func TestCrossFieldInvariants(t *testing.T) {
 			env:     map[string]string{"RUNMESH_LOG_FORMAT": "xml"},
 			wantHit: "RUNMESH_LOG_FORMAT",
 		},
+		{
+			// Zero would register the stream route and then refuse every
+			// request to it, which reads to a dashboard as a broken deployment
+			// rather than as a configured limit.
+			name:    "no streams allowed at all",
+			env:     map[string]string{"RUNMESH_STREAM_MAX": "0"},
+			wantHit: "RUNMESH_STREAM_MAX",
+		},
+		{
+			name:    "stream buffer below one",
+			env:     map[string]string{"RUNMESH_STREAM_BUFFER": "0"},
+			wantHit: "RUNMESH_STREAM_BUFFER",
+		},
+		{
+			// A heartbeat slower than the idle timeout in front of it never
+			// arrives: the connection is reaped first and the client spends its
+			// life reconnecting.
+			name: "heartbeat slower than the idle timeout",
+			env: map[string]string{
+				"RUNMESH_IDLE_TIMEOUT":     "60s",
+				"RUNMESH_STREAM_HEARTBEAT": "90s",
+			},
+			wantHit: "RUNMESH_STREAM_HEARTBEAT",
+		},
+		{
+			// The poll is what makes the stream correct across replicas.
+			name:    "polling disabled",
+			env:     map[string]string{"RUNMESH_STREAM_POLL_INTERVAL": "0s"},
+			wantHit: "RUNMESH_STREAM_POLL_INTERVAL",
+		},
+		{
+			// A frame write that can outlast the drain leaves srv.Shutdown
+			// blocked on a connection that will never go idle.
+			name: "stream write timeout longer than the drain",
+			env: map[string]string{
+				"RUNMESH_SHUTDOWN_GRACE":       "10s",
+				"RUNMESH_STREAM_WRITE_TIMEOUT": "30s",
+			},
+			wantHit: "RUNMESH_STREAM_WRITE_TIMEOUT",
+		},
 	}
 
 	for _, tc := range tests {
@@ -291,5 +334,148 @@ func TestWhitespaceIsTolerated(t *testing.T) {
 	}
 	if _, ok := cfg.APIKeyID(config.KeyDigest(goodKey)); !ok {
 		t.Error("a padded API key was not recognised")
+	}
+}
+
+// TestTheStreamWriteTimeoutFollowsTheDrain: the bound on one SSE frame's write
+// is DERIVED, not fixed, and this pins both halves of that.
+//
+// Ten seconds is the right ceiling — a dead-but-open TCP peer with a full
+// socket buffer would otherwise hold a handler goroutine for ever — but it is
+// only legal while the drain is at least that long. An operator who shortens
+// RUNMESH_SHUTDOWN_GRACE has not asked for a boot failure about a knob they
+// never set, so the default follows the grace down. An operator who sets this
+// one ABOVE the grace has asked for a connection srv.Shutdown will wait on for
+// ever, and that is still refused (see TestCrossFieldInvariants).
+func TestTheStreamWriteTimeoutFollowsTheDrain(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		env  map[string]string
+		want time.Duration
+	}{
+		{
+			name: "the shipped default",
+			want: 10 * time.Second,
+		},
+		{
+			name: "a short drain clamps the unset default rather than refusing to boot",
+			env:  map[string]string{"RUNMESH_SHUTDOWN_GRACE": "2s"},
+			want: 2 * time.Second,
+		},
+		{
+			name: "a long drain does not raise it; ten seconds is the ceiling",
+			env: map[string]string{
+				"RUNMESH_SHUTDOWN_GRACE":  "5m",
+				"RUNMESH_HARD_EXIT_AFTER": "10m", // the watchdog has to outlast the phases
+			},
+			want: 10 * time.Second,
+		},
+		{
+			name: "an explicit value inside the grace is honoured",
+			env: map[string]string{
+				"RUNMESH_SHUTDOWN_GRACE":       "30s",
+				"RUNMESH_HARD_EXIT_AFTER":      "90s",
+				"RUNMESH_STREAM_WRITE_TIMEOUT": "25s",
+			},
+			want: 25 * time.Second,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg, err := config.Load(env(tc.env))
+			if err != nil {
+				t.Fatalf("the configuration was rejected: %v", err)
+			}
+			if cfg.StreamWriteTimeout != tc.want {
+				t.Errorf("StreamWriteTimeout = %s, want %s", cfg.StreamWriteTimeout, tc.want)
+			}
+		})
+	}
+}
+
+// TestStreamingDefaults pins the four remaining streaming knobs, because a
+// dashboard's behaviour — how long it waits for a heartbeat, how stale an event
+// from another replica can be — is set by these and by nothing else.
+func TestStreamingDefaults(t *testing.T) {
+	t.Parallel()
+	cfg, err := config.Load(env(nil))
+	if err != nil {
+		t.Fatalf("a minimal environment was rejected: %v", err)
+	}
+	checks := []struct {
+		name string
+		got  any
+		want any
+	}{
+		{"StreamMax", cfg.StreamMax, 64},
+		{"StreamBuffer", cfg.StreamBuffer, 256},
+		{"StreamHeartbeat", cfg.StreamHeartbeat, 15 * time.Second},
+		{"StreamPollInterval", cfg.StreamPollInterval, time.Second},
+	}
+	for _, c := range checks {
+		if c.got != c.want {
+			t.Errorf("%s = %v, want %v", c.name, c.got, c.want)
+		}
+	}
+}
+
+// TestEveryVariableIsDocumented walks .env.example against the loader.
+//
+// The symmetry between the two has been maintained by discipline alone, and
+// discipline is exactly what fails when a feature lands at the end of a week.
+// Both directions matter and they fail differently: a variable the loader reads
+// but the file never mentions is a knob nobody can discover, and a variable the
+// file documents but the loader never reads is a knob an operator sets, ships,
+// and watches do nothing.
+//
+// The loader's own key list is collected by recording every lookup rather than
+// by maintaining a second list here, because a second list would need the same
+// discipline this test exists to replace.
+func TestEveryVariableIsDocumented(t *testing.T) {
+	t.Parallel()
+
+	read := make(map[string]bool)
+	_, _ = config.Load(func(k string) string {
+		if strings.HasPrefix(k, "RUNMESH_") {
+			read[k] = true
+		}
+		if k == "RUNMESH_API_KEYS" {
+			return "ci=" + goodKey
+		}
+		return ""
+	})
+	if len(read) == 0 {
+		t.Fatal("the loader read no RUNMESH_ variables at all")
+	}
+
+	raw, err := os.ReadFile(filepath.Join("..", "..", ".env.example"))
+	if err != nil {
+		t.Fatalf("reading .env.example: %v", err)
+	}
+	// A documented variable is an assignment, live or commented out. Prose that
+	// merely names a variable is not documentation of its value.
+	assignment := regexp.MustCompile(`^#?\s*(RUNMESH_[A-Z0-9_]+)=`)
+	documented := make(map[string]bool)
+	for _, line := range strings.Split(string(raw), "\n") {
+		if m := assignment.FindStringSubmatch(strings.TrimSpace(line)); m != nil {
+			documented[m[1]] = true
+		}
+	}
+
+	for key := range read {
+		if !documented[key] {
+			t.Errorf("%s is read by config.Load but is not in .env.example: a knob "+
+				"nobody can discover", key)
+		}
+	}
+	for key := range documented {
+		if !read[key] {
+			t.Errorf("%s is in .env.example but config.Load never reads it: an "+
+				"operator can set it, ship it, and watch it do nothing", key)
+		}
 	}
 }

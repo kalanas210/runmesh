@@ -81,6 +81,57 @@ type eventsResponse struct {
 	OldestSeq uint64          `json:"oldest_seq"`
 }
 
+// ---------------------------------------------------------------- SSE frames
+//
+// The payload of an `event: event` frame is ONE runmesh.Event, marshalled
+// exactly as an element of eventsResponse.Events above. That is not laziness,
+// it is the fallback plan written into the wire format: if the stream ever has
+// to be abandoned for the polling endpoint it was built to accelerate, the
+// browser's Event type and the reducer that folds events into waterfall rows
+// are unchanged and the swap is a transport change rather than a rewrite. The
+// domain Event stays the deliberate verbatim exception it already was; jobs and
+// steps still travel as the mapped DTOs.
+
+// streamSnapshot is the single `event: snapshot` frame sent at open.
+//
+// It carries the job AND the timeline page in one frame, which deletes a race
+// class rather than documenting it: the alternative is "GET the job, then open
+// a stream, and hope nothing happened in between", and nothing about that gap
+// is observable to the client that fell into it. The four page fields are the
+// same four eventsResponse carries, so a client that already knows how to
+// resume from next_after or react to truncated needs no new logic.
+type streamSnapshot struct {
+	Job       jobResponse     `json:"job"`
+	Events    []runmesh.Event `json:"events"`
+	NextAfter uint64          `json:"next_after"`
+	Truncated bool            `json:"truncated"`
+	OldestSeq uint64          `json:"oldest_seq"`
+}
+
+// streamResync says the client's cursor predates retained history, so anything
+// it holds from before oldest_seq can never be filled in. The in-memory store's
+// event ring evicts; PostgreSQL does not, so this frame is real only under
+// RUNMESH_STORE=memory today. Telling the client beats rendering a timeline
+// with a silent hole in it.
+type streamResync struct {
+	Reason    string `json:"reason"`
+	OldestSeq uint64 `json:"oldest_seq"`
+}
+
+// streamEnd is the job reaching a terminal state with the timeline complete.
+// It means STOP RECONNECTING: there will never be another event for this job,
+// and a client that reconnects anyway pays for an idle connection for ever.
+type streamEnd struct {
+	State string `json:"state"`
+}
+
+// streamBye is the server going away — a drain, or the store closing
+// underneath the subscription. Unlike streamEnd it means reconnect, with
+// backoff, from the last id received.
+type streamBye struct {
+	Reason string `json:"reason"`
+}
+
 type toolsResponse struct {
 	Tools []tools.Descriptor `json:"tools"`
 }

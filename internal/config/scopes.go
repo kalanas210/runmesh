@@ -26,6 +26,24 @@ const (
 	// purpose: submitting work and stopping somebody else's are different
 	// authorities.
 	ScopeJobsCancel Scope = "jobs.cancel"
+	// ScopeMetricsRead covers GET /api/v1/metrics and nothing else.
+	//
+	// Its own scope rather than jobs.read, by exactly the argument that split
+	// jobs.cancel out of jobs.write: reading aggregate counters and reading job
+	// payloads are different authorities. A Prometheus scraper needs queue
+	// depth, attempt rates and per-tool failure codes; it has no business
+	// listing every job and reading every event body, tool results included —
+	// and a scrape credential is the one credential in a deployment that is
+	// configured once, stored in a config map next to the scrape job, and then
+	// never rotated.
+	//
+	// The endpoint is scoped rather than public because the justification the
+	// probes carry does not extend to it: a load balancer often cannot hold a
+	// credential, whereas Prometheus has an authorization stanza and a
+	// credentials_file in scrape_configs. An unauthenticated /metrics hands
+	// queue depth, job counts and per-tool failure codes to anyone who can
+	// reach the port.
+	ScopeMetricsRead Scope = "metrics.read"
 	// ScopeAdmin implies every other scope. It exists so an operator key does
 	// not have to be re-issued each time a scope is added.
 	ScopeAdmin Scope = "admin"
@@ -33,7 +51,7 @@ const (
 
 // AllScopes is the whole vocabulary, in the order it is reported to an
 // operator who mistypes one.
-var AllScopes = []Scope{ScopeJobsRead, ScopeJobsWrite, ScopeJobsCancel, ScopeAdmin}
+var AllScopes = []Scope{ScopeJobsRead, ScopeJobsWrite, ScopeJobsCancel, ScopeMetricsRead, ScopeAdmin}
 
 func validScope(s Scope) bool {
 	for _, v := range AllScopes {

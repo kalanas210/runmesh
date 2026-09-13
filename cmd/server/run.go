@@ -10,18 +10,22 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime"
 	"time"
 
 	"github.com/kalanas210/runmesh/internal/clock"
 	"github.com/kalanas210/runmesh/internal/config"
 	"github.com/kalanas210/runmesh/internal/engine"
+	"github.com/kalanas210/runmesh/internal/eventbus"
 	"github.com/kalanas210/runmesh/internal/gemini"
 	"github.com/kalanas210/runmesh/internal/httpapi"
 	"github.com/kalanas210/runmesh/internal/k8s"
 	"github.com/kalanas210/runmesh/internal/memstore"
+	"github.com/kalanas210/runmesh/internal/metrics"
 	"github.com/kalanas210/runmesh/internal/pgstore"
 	"github.com/kalanas210/runmesh/internal/planner"
 	"github.com/kalanas210/runmesh/internal/policy"
+	"github.com/kalanas210/runmesh/internal/runmesh"
 	"github.com/kalanas210/runmesh/internal/tools"
 )
 
@@ -33,6 +37,19 @@ import (
 type store interface {
 	engine.Store
 	httpapi.Store
+	// Dropped is the store's own count of events it could not hand to an
+	// in-process subscriber because that subscriber was too slow. Both stores
+	// already had it — the fan-out has always counted its drops rather than
+	// blocking — and naming it here is what turns a number that existed into a
+	// number an operator can see. internal/storetest declares it too, so both
+	// implementations are held to it rather than merely happening to have it.
+	Dropped() uint64
+	// Subscribe is the live event feed the streaming route is built on. Both
+	// stores already had it and internal/storetest already held both to it, so
+	// naming it here widened no store file and changed no conformance suite —
+	// which is the whole reason the union lives in this file rather than being
+	// exported by either consumer.
+	Subscribe(buf int) (<-chan runmesh.Event, func())
 	Close() error
 }
 
@@ -293,6 +310,13 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 	slog.SetDefault(log)
 
 	clk := clock.System()
+
+	// The metrics registry is constructed here and injected downwards, like
+	// every other dependency. Nothing registers itself in an init() and nothing
+	// reaches for a package-level default registerer — which is, on its own,
+	// why promauto was never an option. See ADR 0012.
+	reg := metrics.NewRegistry(clk)
+
 	store, err := openStore(ctx, cfg, log)
 	if err != nil {
 		log.Error("could not open the store", "store", cfg.StoreName(), "err", err)
@@ -305,6 +329,45 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 		TaskImage:       cfg.TaskImage,
 		PythonImage:     cfg.PythonImage,
 	})
+	// The metric set is built once the label vocabularies exist, and it is built
+	// FROM them rather than from a hard-coded list: the tools come from the
+	// registry that was just constructed and the routes from the API's own
+	// table. That is what makes "the maximum number of time series this process
+	// can export is a constant" true of the wiring rather than of a comment —
+	// see internal/metrics/labels.go.
+	mset := metrics.NewSet(reg, metrics.Vocabulary{
+		Tools:  registry.Names(),
+		Routes: httpapi.RoutePatterns(),
+		// The API owns the fact that a route is long-lived, so it reports it
+		// rather than this list repeating it. A stream's elapsed time is a
+		// connection lifetime, not a service latency, and putting it in the
+		// duration histogram would make every latency panel in the deployment
+		// describe how long people leave browser tabs open — with nothing
+		// failing to say so.
+		StreamingRoutes: httpapi.StreamingRoutePatterns(),
+		Version:         version,
+		GoVersion:       runtime.Version(),
+	})
+
+	// Store latency, wrapped here rather than added to engine.Store. The
+	// interface is untouched; see cmd/server/store_metrics.go for why that is
+	// the whole point.
+	store = observedStore{store: store, m: mset, clk: clk}
+
+	// The live event fan-out behind GET /api/v1/jobs/{id}/stream.
+	//
+	// It is constructed here and not inside internal/engine, because that
+	// package's doc fixes the goroutine census at 2 + Workers plus one per
+	// in-flight step and a fan-out goroutine there would contradict a stated
+	// invariant that no test would catch. It is an ACCELERATOR and not a source
+	// of truth: the handler serves the durable timeline on a poll ticker and the
+	// bus only shortens the wait, which is what makes the stream correct on a
+	// multi-replica deployment rather than merely excused. Its Close is
+	// registered in shutdown(), between the engine's drain and the store's
+	// close, for reasons the ordering there spells out.
+	bus := eventbus.New(store, log)
+	bus.Start(ctx)
+
 	executor, err := newExecutor(cfg, registry, clk, log)
 	if err != nil {
 		log.Error("could not build the executor", "executor", cfg.Executor, "err", err)
@@ -340,11 +403,21 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 			Factor: cfg.BackoffFactor,
 			Jitter: cfg.BackoffJitter,
 		},
-	}, engine.Deps{Store: store, Executor: executor, Sandbox: sandbox, Clock: clk, Log: log})
+	}, engine.Deps{Store: store, Executor: executor, Sandbox: sandbox,
+		Observer: mset, Clock: clk, Log: log})
 	if err != nil {
 		log.Error("could not build the engine", "err", err)
 		return 1
 	}
+
+	// The runtime and store gauges are PULLED at scrape time from the objects
+	// that already own the numbers, so nothing is mirrored and nothing can drift
+	// from engine.Stats(). Binding them also means the registry owns no
+	// goroutine of its own — which matters, because the engine's package doc
+	// fixes the goroutine census and an aggregation loop would contradict it
+	// while nothing failed.
+	mset.BindRuntime(eng)
+	mset.BindStore(store)
 
 	plannerImpl, err := newPlanner(cfg, sandbox, log)
 	if err != nil {
@@ -358,6 +431,9 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 		Sandbox:         sandbox,
 		Planner:         plannerImpl,
 		Runtime:         eng,
+		Gatherer:        reg,
+		Metrics:         mset,
+		Stream:          bus,
 		Clock:           clk,
 		Log:             log,
 		APIKeys:         cfg.APIKeys,
@@ -368,11 +444,26 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 		Durable:         cfg.Durable(),
 		StoreName:       cfg.StoreName(),
 		ExecutionMode:   executionMode(cfg),
+
+		StreamMax:          cfg.StreamMax,
+		StreamBuffer:       cfg.StreamBuffer,
+		StreamHeartbeat:    cfg.StreamHeartbeat,
+		StreamPollInterval: cfg.StreamPollInterval,
+		StreamWriteTimeout: cfg.StreamWriteTimeout,
 	})
 	if err != nil {
 		log.Error("could not build the API", "err", err)
 		return 1
 	}
+
+	// Open streams are a GAUGE and not a histogram observation, and that is the
+	// whole point of binding it here. Logger's duration observation fires when a
+	// handler RETURNS, and a stream handler returns when somebody closes a
+	// browser tab — so the request-duration histogram excludes this route (see
+	// httpapi.StreamingRoutePatterns) and the count is pulled from the API's own
+	// admission counter at scrape time instead. Nothing is mirrored, so the
+	// gauge cannot drift from the number the 429 is decided against.
+	mset.BindStreams(api)
 
 	// A permissive default is defensible only if it cannot be held by accident,
 	// so every key that carries no scope restriction is named once at boot.
@@ -434,14 +525,14 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 	case <-ctx.Done():
 	}
 
-	return shutdown(srv, eng, store, api, log, cfg)
+	return shutdown(srv, eng, bus, store, api, log, cfg)
 }
 
 // shutdown runs the ordered drain. Every phase is bounded, and the last resort
 // is a hard exit: a process that will not stop is worse than one that stops
 // untidily, because an orchestrator has to SIGKILL it and nothing gets to
 // record why.
-func shutdown(srv *http.Server, eng *engine.Engine, store store,
+func shutdown(srv *http.Server, eng *engine.Engine, bus *eventbus.Broker, store store,
 	api *httpapi.API, log *slog.Logger, cfg config.Config) int {
 
 	log.Info("shutdown requested",
@@ -490,7 +581,22 @@ func shutdown(srv *http.Server, eng *engine.Engine, store store,
 	}
 	cancel()
 
-	// 3. Close the store. Safe even if a straggler is still writing: Close is a
+	// 3. Stop the event fan-out, and THIS POSITION IS THE WHOLE SAFETY
+	//    ARGUMENT. After the engine, so nothing is still producing events with
+	//    the consumer gone; before the store, so the pump is not left reading a
+	//    channel the store closed underneath it. Putting it in a defer beside
+	//    the store's Close — the obvious-looking move — gets the order exactly
+	//    backwards and leaves it to the hard-exit watchdog.
+	//
+	//    Any stream still attached has already seen the `bye` frame, because
+	//    api.Draining() fired at the top of this function and every handler
+	//    selects on it; this is the cleanup behind them, not the signal.
+	if err := bus.Close(); err != nil {
+		log.Warn("the event bus did not close cleanly", "err", err)
+		code = 1
+	}
+
+	// 4. Close the store. Safe even if a straggler is still writing: Close is a
 	//    state change, so a late write gets ErrClosed rather than a panic.
 	if err := store.Close(); err != nil {
 		log.Warn("store did not close cleanly", "err", err)

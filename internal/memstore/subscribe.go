@@ -8,7 +8,11 @@ import (
 )
 
 // subscriber is one live event consumer: a test asserting on the exact
-// transition sequence today, the WebSocket fan-out in Week 6.
+// transition sequence, and in production internal/eventbus, which fans this
+// store's stream out to the Server-Sent Events handler in
+// internal/httpapi/stream.go. Not a WebSocket fan-out — ADR 0013 chose SSE over
+// the WebSocket the plan document named, and the difference reaches this file:
+// SSE is one-way, so nothing downstream ever needs to write back through here.
 //
 // The channel has exactly ONE closer. Both the unsubscribe function and
 // Store.Close can end a subscription, and both go through the same sync.Once,

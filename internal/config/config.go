@@ -145,6 +145,25 @@ type Config struct {
 	// Observability
 	LogLevel  slog.Level
 	LogFormat string // "json" or "text"
+
+	// Live event streaming: GET /api/v1/jobs/{id}/stream.
+	//
+	// StreamMax caps concurrent SSE connections, because each one costs a
+	// goroutine, a store subscription and a socket for as long as a browser tab
+	// is left open, and the refusal is a 429 a client can back off from.
+	// StreamBuffer is one connection's share of the in-process fan-out; a full
+	// one drops rather than blocking, and the handler repairs the drop from the
+	// durable timeline. StreamHeartbeat keeps intermediaries from reaping a
+	// correct but silent connection. StreamPollInterval is the leg that makes
+	// this multi-replica correct: the maximum staleness of an event written by a
+	// replica this connection's bus never saw. StreamWriteTimeout bounds one
+	// frame's write so a dead-but-open peer cannot hold a handler goroutine for
+	// the life of the process.
+	StreamMax          int
+	StreamBuffer       int
+	StreamHeartbeat    time.Duration
+	StreamPollInterval time.Duration
+	StreamWriteTimeout time.Duration
 }
 
 // Load reads configuration from getenv (os.Getenv in production, a map in
@@ -274,6 +293,21 @@ func Load(getenv func(string) string) (Config, error) {
 
 		LogLevel:  l.level("RUNMESH_LOG_LEVEL", slog.LevelInfo),
 		LogFormat: l.str("RUNMESH_LOG_FORMAT", "json"),
+
+		StreamMax:    l.num("RUNMESH_STREAM_MAX", 64),
+		StreamBuffer: l.num("RUNMESH_STREAM_BUFFER", 256),
+		// Fifteen seconds is under every default idle timeout an operator is
+		// likely to have in front of this — nginx's proxy_read_timeout is 60s,
+		// an AWS ALB's idle timeout is 60s, and this server's own is 60s.
+		StreamHeartbeat: l.dur("RUNMESH_STREAM_HEARTBEAT", 15*time.Second),
+		// One second is the worst-case staleness on a replica that did not write
+		// the event. It is also a floor on cost — one indexed lookup per open
+		// stream per second on an idle job — which is why a live event resets
+		// the ticker and why a stream closes itself when its job is terminal.
+		StreamPollInterval: l.dur("RUNMESH_STREAM_POLL_INTERVAL", time.Second),
+		// Zero here means "not set"; the value is DERIVED below, because the
+		// legal range for it depends on another variable.
+		StreamWriteTimeout: l.dur("RUNMESH_STREAM_WRITE_TIMEOUT", 0),
 	}
 	c.APIKeys = l.apiKeys("RUNMESH_API_KEYS")
 	if c.ClaimBatch == 0 {
@@ -288,6 +322,20 @@ func Load(getenv func(string) string) (Config, error) {
 	}
 	if c.DBMaxIdleConns == 0 {
 		c.DBMaxIdleConns = c.DBMaxOpenConns
+	}
+	// One frame's write is bounded so that a TCP peer which is dead but not
+	// closed, with a full socket buffer, cannot hold a handler goroutine for
+	// ever. Ten seconds is the right bound — but it is only LEGAL while the
+	// drain is at least that long, because a write that outlasts the drain
+	// leaves srv.Shutdown blocked on a connection that will never go idle.
+	//
+	// So it is derived rather than fixed, exactly as ClaimBatch is derived from
+	// Workers above. An operator who shortens RUNMESH_SHUTDOWN_GRACE has not
+	// thereby asked for a boot failure about a knob they never set; an operator
+	// who sets this one longer than the grace HAS asked for that connection, and
+	// Validate still refuses it.
+	if c.StreamWriteTimeout == 0 {
+		c.StreamWriteTimeout = min(defaultStreamWriteTimeout, c.ShutdownGrace)
 	}
 	// The Go tools' image is the default task image unless it is overridden,
 	// so a single-image deployment configures one variable and a two-image one
@@ -523,6 +571,36 @@ func (c Config) Validate() []error {
 	default:
 		bad("RUNMESH_LOG_FORMAT must be json or text, got %q", c.LogFormat)
 	}
+	if c.StreamMax < 1 {
+		bad("RUNMESH_STREAM_MAX must be >= 1, got %d: zero would register the "+
+			"stream route and then refuse every request to it", c.StreamMax)
+	}
+	if c.StreamBuffer < 1 {
+		bad("RUNMESH_STREAM_BUFFER must be >= 1, got %d", c.StreamBuffer)
+	}
+	// A heartbeat slower than an intermediary's idle timeout is a heartbeat that
+	// never arrives: the proxy reaps the connection first, the browser
+	// reconnects, and the reconnect loop looks like an unstable backend. This
+	// server's own IdleTimeout is the one such timeout the process can see, so
+	// it is the one it can check.
+	if c.StreamHeartbeat <= 0 || c.StreamHeartbeat >= c.IdleTimeout {
+		bad("RUNMESH_STREAM_HEARTBEAT must be in (0, RUNMESH_IDLE_TIMEOUT=%s), got %s: "+
+			"a heartbeat slower than an intermediary's idle timeout is a heartbeat "+
+			"that never arrives", c.IdleTimeout, c.StreamHeartbeat)
+	}
+	if c.StreamPollInterval <= 0 {
+		bad("RUNMESH_STREAM_POLL_INTERVAL must be > 0, got %s: the poll is what "+
+			"makes the stream correct across replicas, and disabling it would make "+
+			"the in-process bus the only source", c.StreamPollInterval)
+	}
+	// A write that can outlast the drain leaves srv.Shutdown blocked on a
+	// connection that will never go idle, which is the failure the drain
+	// handling in the stream handler exists to prevent.
+	if c.StreamWriteTimeout <= 0 || c.StreamWriteTimeout > c.ShutdownGrace {
+		bad("RUNMESH_STREAM_WRITE_TIMEOUT must be in (0, RUNMESH_SHUTDOWN_GRACE=%s], got %s: "+
+			"a write that can outlast the drain leaves srv.Shutdown blocked on a "+
+			"connection that will never go idle", c.ShutdownGrace, c.StreamWriteTimeout)
+	}
 	return errs
 }
 
@@ -554,6 +632,12 @@ func (c Config) RunsInKubernetes() bool { return c.Executor == ExecutorKubernete
 // pool: one for the dispatcher, one for the reconciler, and two for concurrent
 // API traffic including the readiness probe.
 const dbConnHeadroom = 4
+
+// defaultStreamWriteTimeout is the ceiling on one SSE frame's write, before the
+// shutdown grace clamps it. It is a constant rather than a literal in the
+// loader because the loader reads zero for "not set" and the real default lives
+// in the derivation a few lines below the Config literal.
+const defaultStreamWriteTimeout = 10 * time.Second
 
 // Durable reports whether the configured store survives a restart. It is the
 // value GET /api/v1/ready publishes, and the reason the server warns at boot

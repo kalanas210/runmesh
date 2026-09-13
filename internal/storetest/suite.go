@@ -48,6 +48,12 @@ type Store interface {
 	httpapi.Store
 	TailEvents(ctx context.Context, afterGlobal uint64, limit int) ([]runmesh.Event, error)
 	Subscribe(buf int) (<-chan runmesh.Event, func())
+	// Dropped is the counterpart to the non-blocking fan-out: the number of
+	// events a slow subscriber was not given. It is declared here, and not only
+	// in cmd/server where the metrics exporter reads it, so that BOTH stores are
+	// held to the same meaning — otherwise a future pgstore refactor could
+	// quietly change what "dropped" counts and nothing would fail.
+	Dropped() uint64
 	Close() error
 }
 
@@ -93,6 +99,7 @@ func RunSuite(t *testing.T, newStore Factory) {
 		{"EventPaging", testEventPaging},
 		{"TailEvents", testTailEvents},
 		{"SubscribeDropsRatherThanBlocks", testSubscribeDropsRatherThanBlocks},
+		{"DropsAreCounted", testDropsAreCounted},
 		{"SubscribeUnsubscribeIsRaceFree", testSubscribeUnsubscribeIsRaceFree},
 		{"ReadyHintIsLossy", testReadyHintIsLossy},
 		{"QueueDepthMatchesClaimPredicate", testQueueDepthMatchesClaimPredicate},
@@ -847,6 +854,35 @@ func testSubscribeDropsRatherThanBlocks(t *testing.T, s Store) {
 	case <-ch:
 	default:
 		t.Fatal("subscriber received nothing at all")
+	}
+}
+
+// testDropsAreCounted pins the other half of that rule: a store that drops
+// silently is a store whose subscribers cannot tell a quiet system from a lost
+// event, so the drop is counted and the count is readable.
+//
+// It matters that BOTH stores are held to this. The Week-6 metrics exporter
+// publishes Dropped() as runmesh_store_events_dropped_total, and an
+// implementation whose counter meant something slightly different — attempts
+// rather than events, say — would produce a graph that is wrong in a way no
+// test would catch.
+func testDropsAreCounted(t *testing.T, s Store) {
+	if n := s.Dropped(); n != 0 {
+		t.Fatalf("a fresh store reports %d dropped events, want 0", n)
+	}
+
+	// One slot, and far more events than slots, with nobody reading. Delivery
+	// is a non-blocking send on both stores, so every event past the first is
+	// necessarily dropped rather than queued.
+	_, unsubscribe := s.Subscribe(1)
+	defer unsubscribe()
+
+	for i := range 200 {
+		mustCreate(t, s, job(t, "job_"+itoa(i), epoch, nil, "a"))
+	}
+	if n := s.Dropped(); n == 0 {
+		t.Fatal("200 jobs were published to a subscriber with one slot and " +
+			"nothing was counted as dropped; the counter is not wired to the fan-out")
 	}
 }
 

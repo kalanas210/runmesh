@@ -134,6 +134,12 @@ func classifyError(err error) (int, APIError) {
 			Message: "the request body is too large",
 		}
 
+	case errors.Is(err, errNoMetrics):
+		return http.StatusNotImplemented, APIError{
+			Code:    CodeUnimplemented,
+			Message: "this deployment exports no metrics",
+		}
+
 	case errors.Is(err, errNoPlanner):
 		return http.StatusNotImplemented, APIError{
 			Code: CodeUnimplemented,
