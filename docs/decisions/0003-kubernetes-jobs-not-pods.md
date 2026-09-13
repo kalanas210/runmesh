@@ -35,6 +35,15 @@ spec:
 
   The division of labour is: **RunMesh owns retries, Kubernetes owns isolation
   and lifecycle.**
+- `backoffLimit: 0` also means Kubernetes fails the Job for *any* pod that
+  stops without succeeding, so a task that exited 1 and a pod that was deleted,
+  evicted or preempted arrive as the same `BackoffLimitExceeded`. RunMesh tells
+  them apart by asking the pod (added 2026-09-13, after `kubectl delete pod`
+  was found to fail a step for good): positive evidence of removal — the pod
+  gone, a deletion timestamp, `Evicted`, or a `DisruptionTarget` condition — is
+  a retryable `workload_lost`. Anything else stays terminal, including an OOM
+  kill, whose next attempt would meet the same limit, and a failure whose pod
+  cannot be read at all.
 
 ## Alternatives considered
 

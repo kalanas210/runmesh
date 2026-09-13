@@ -263,3 +263,60 @@ func TestIntegrationCancellationDeletesTheWorkload(t *testing.T) {
 		t.Fatalf("Job %s still exists after cancellation; its pod is an orphan", name)
 	}
 }
+
+// TestIntegrationADeletedPodIsRetried. `kubectl delete pod` — like a drain, an
+// eviction or a preemption — makes Kubernetes fail a backoffLimit-0 Job with
+// exactly the condition a task that exited 1 produces. The executor has to ask
+// the pod which of the two happened, and this proves the answer against a real
+// Job controller, which a fake clientset does not have.
+func TestIntegrationADeletedPodIsRetried(t *testing.T) {
+	cfg, exec := integrationConfig(t)
+
+	client, err := k8s.NewClient(os.Getenv("RUNMESH_TEST_KUBECONFIG"), os.Getenv("RUNMESH_TEST_KUBECONTEXT"))
+	if err != nil {
+		t.Fatalf("client: %v", err)
+	}
+
+	in := integrationInput("sleep", "doomed", `{"duration":"120s"}`, 1)
+	name := k8s.JobName(in.AttemptID)
+
+	ctx, cancel := clock.System().WithTimeout(t.Context(), 3*time.Minute)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { _, e := exec.Execute(ctx, in); done <- e }()
+
+	// Delete only once the pod is Running, so the delete lands on a task that is
+	// genuinely mid-flight rather than on one still being scheduled.
+	pod := ""
+	for pod == "" {
+		if ctx.Err() != nil {
+			t.Fatal("the pod never reached Running")
+		}
+		list, err := client.CoreV1().Pods(cfg.Namespace).List(ctx, metav1.ListOptions{
+			LabelSelector: "batch.kubernetes.io/job-name=" + name,
+		})
+		if err == nil {
+			for _, p := range list.Items {
+				if string(p.Status.Phase) == "Running" {
+					pod = p.Name
+				}
+			}
+		}
+		_ = clock.System().Sleep(ctx, 250*time.Millisecond)
+	}
+	if err := client.CoreV1().Pods(cfg.Namespace).Delete(ctx, pod, metav1.DeleteOptions{}); err != nil {
+		t.Fatalf("deleting pod %s: %v", pod, err)
+	}
+
+	err = <-done
+	var te *runmesh.ToolError
+	if !errors.As(err, &te) {
+		t.Fatalf("Execute returned %v, want a classified *runmesh.ToolError", err)
+	}
+	if !te.Retryable || te.Code != runmesh.CodeWorkloadLost {
+		t.Fatalf("a deleted pod was classified %q (retryable=%v): %v; want a retryable %q. "+
+			"Nothing in the task failed; it was taken away",
+			te.Code, te.Retryable, te, runmesh.CodeWorkloadLost)
+	}
+	// The Job is left to TTLAfterFinished, like every other Job this suite creates.
+}

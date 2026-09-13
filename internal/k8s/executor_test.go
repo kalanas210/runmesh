@@ -64,6 +64,32 @@ func failedWith(reason, message string) batchv1.JobStatus {
 	}
 }
 
+// podOf builds the pod a Job's controller would have created, labelled the way
+// the executor finds a real one. As built, its task exited non-zero on its own;
+// mutate turns it into one of the other stories.
+func podOf(jobName string, mutate func(*corev1.Pod)) *corev1.Pod {
+	p := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      jobName + "-x7k2p",
+			Namespace: "runmesh-tasks",
+			Labels:    map[string]string{"batch.kubernetes.io/job-name": jobName},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodFailed,
+			ContainerStatuses: []corev1.ContainerStatus{{
+				Name: containerName,
+				State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+					ExitCode: 1, Reason: "Error",
+				}},
+			}},
+		},
+	}
+	if mutate != nil {
+		mutate(p)
+	}
+	return p
+}
+
 // alwaysGet makes every Get of a Job return the given status, so the wait loop
 // is driven deterministically rather than by whatever a controller would have
 // done — there is no controller behind a fake clientset.
@@ -140,19 +166,29 @@ func TestExecuteAdoptsAnExistingJob(t *testing.T) {
 	}
 }
 
+// TestExecuteClassifiesFailures. Every failed Job here reads the same from the
+// Job alone — BackoffLimitExceeded — so each case says what its pod shows, and
+// the pod decides between "the task failed" and "the task was taken away".
 func TestExecuteClassifiesFailures(t *testing.T) {
 	t.Parallel()
 
+	job := JobName(testInput().AttemptID)
+	backoff := failedWith("BackoffLimitExceeded", "Job has reached the specified backoff limit")
+
 	cases := []struct {
-		name        string
-		status      batchv1.JobStatus
+		name   string
+		status batchv1.JobStatus
+		// pod is the Job's pod as the executor finds it; nil means it no
+		// longer exists.
+		pod         *corev1.Pod
 		wantCode    string
 		wantRetry   bool
 		description string
 	}{
 		{
 			name:      "the task exited non-zero",
-			status:    failedWith("BackoffLimitExceeded", "Job has reached the specified backoff limit"),
+			status:    backoff,
+			pod:       podOf(job, nil),
 			wantCode:  runmesh.CodeContractBroken,
 			wantRetry: false,
 			description: "terminal by default, the same rule the in-process executor " +
@@ -161,6 +197,7 @@ func TestExecuteClassifiesFailures(t *testing.T) {
 		{
 			name:      "Kubernetes hit the backstop deadline",
 			status:    failedWith("DeadlineExceeded", "Job was active longer than specified deadline"),
+			pod:       podOf(job, nil),
 			wantCode:  runmesh.CodeTimeout,
 			wantRetry: true,
 			description: "the backstop only fires when RunMesh was not watching, " +
@@ -169,15 +206,79 @@ func TestExecuteClassifiesFailures(t *testing.T) {
 		{
 			name:      "failed with no condition yet",
 			status:    batchv1.JobStatus{Failed: 1},
+			pod:       podOf(job, nil),
 			wantCode:  runmesh.CodeContractBroken,
 			wantRetry: false,
+		},
+		{
+			name:   "the kernel killed it for memory",
+			status: backoff,
+			pod: podOf(job, func(p *corev1.Pod) {
+				p.Status.ContainerStatuses[0].State.Terminated.ExitCode = 137
+				p.Status.ContainerStatuses[0].State.Terminated.Reason = "OOMKilled"
+			}),
+			wantCode:  runmesh.CodeContractBroken,
+			wantRetry: false,
+			description: "the memory limit is the operator's grant, and another attempt " +
+				"meets exactly the same one",
+		},
+		{
+			name:   "its pod was deleted",
+			status: backoff,
+			pod: podOf(job, func(p *corev1.Pod) {
+				now := metav1.Now()
+				p.DeletionTimestamp = &now
+			}),
+			wantCode:  runmesh.CodeWorkloadLost,
+			wantRetry: true,
+			description: "kubectl delete pod, or a drain: nothing in the task failed, " +
+				"it was taken away",
+		},
+		{
+			name:        "its pod is already gone",
+			status:      backoff,
+			pod:         nil,
+			wantCode:    runmesh.CodeWorkloadLost,
+			wantRetry:   true,
+			description: "TTL cleanup cannot have removed it yet, so something deleted it",
+		},
+		{
+			name:   "its pod was evicted",
+			status: backoff,
+			pod: podOf(job, func(p *corev1.Pod) {
+				p.Status.Reason = "Evicted"
+				p.Status.Message = "The node was low on resource: memory."
+				p.Status.ContainerStatuses = nil
+			}),
+			wantCode:    runmesh.CodeWorkloadLost,
+			wantRetry:   true,
+			description: "pressure on the node is not this task failing",
+		},
+		{
+			name:   "its pod was preempted",
+			status: backoff,
+			pod: podOf(job, func(p *corev1.Pod) {
+				p.Status.Conditions = []corev1.PodCondition{{
+					Type: corev1.DisruptionTarget, Status: corev1.ConditionTrue,
+					Reason: "PreemptionByScheduler",
+				}}
+			}),
+			wantCode:    runmesh.CodeWorkloadLost,
+			wantRetry:   true,
+			description: "Kubernetes says in so many words that it took the pod away",
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			cs := fake.NewClientset()
+			var objects []runtime.Object
+			if tc.pod != nil {
+				// A copy per subtest: the fake's tracker writes to what it is
+				// given, and these cases run in parallel.
+				objects = append(objects, tc.pod.DeepCopy())
+			}
+			cs := fake.NewClientset(objects...)
 			alwaysGet(cs, tc.status)
 
 			_, err := newTestExecutor(t, cs).Execute(t.Context(), testInput())
@@ -189,6 +290,27 @@ func TestExecuteClassifiesFailures(t *testing.T) {
 				t.Errorf("retryable = %v, want %v (%s)", te.Retryable, tc.wantRetry, tc.description)
 			}
 		})
+	}
+}
+
+// TestExecuteKeepsAFailureTerminalWhenThePodCannotBeRead. A retry needs
+// evidence that the pod was taken away, and an API error while looking for it
+// is not evidence of anything, so the Job's own verdict stands.
+func TestExecuteKeepsAFailureTerminalWhenThePodCannotBeRead(t *testing.T) {
+	t.Parallel()
+
+	cs := fake.NewClientset()
+	alwaysGet(cs, failedWith("BackoffLimitExceeded", "Job has reached the specified backoff limit"))
+	cs.PrependReactor("list", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewServiceUnavailable("the API server is restarting")
+	})
+
+	_, err := newTestExecutor(t, cs).Execute(t.Context(), testInput())
+	te := toolError(t, err)
+	if te.Retryable || te.Code != runmesh.CodeContractBroken {
+		t.Fatalf("got %q (retryable=%v), want a terminal %q: a pod nobody could read "+
+			"was treated as evidence that it was taken away",
+			te.Code, te.Retryable, runmesh.CodeContractBroken)
 	}
 }
 
@@ -285,5 +407,10 @@ func TestExecuteRetriesADisappearedJob(t *testing.T) {
 	te := toolError(t, err)
 	if !te.Retryable {
 		t.Fatalf("a Job deleted mid-flight was classified terminal (%v)", te)
+	}
+	if te.Code != runmesh.CodeWorkloadLost {
+		t.Errorf("code = %q, want %q: a deleted Job and a deleted pod are the same "+
+			"story, and a dashboard should not have to know two names for it",
+			te.Code, runmesh.CodeWorkloadLost)
 	}
 }

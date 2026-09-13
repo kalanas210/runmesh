@@ -193,7 +193,7 @@ func (e *Executor) Execute(ctx context.Context, in tools.Input) (tools.Output, e
 	result, logErr := e.collectResult(ctx, in, name)
 
 	if failure := jobFailure(job); failure != nil {
-		return tools.Output{}, failure
+		return tools.Output{}, e.unlessTakenAway(ctx, name, failure)
 	}
 	if logErr != nil {
 		return tools.Output{}, logErr
@@ -224,7 +224,7 @@ func (e *Executor) waitForTerminal(ctx context.Context, name string) (*batchv1.J
 			// Somebody deleted the Job out from under us — an operator, or a
 			// namespace cleanup. Retryable: the step genuinely did not run, and
 			// a fresh attempt is the correct response.
-			return nil, runmesh.Retry(runmesh.CodeUnclassified,
+			return nil, runmesh.Retry(runmesh.CodeWorkloadLost,
 				"the Job disappeared before it finished")
 		case err != nil:
 			return nil, classifyAPIError(err, "reading the Job")
@@ -268,6 +268,10 @@ func terminal(job *batchv1.Job) bool {
 
 // jobFailure turns a failed Job into a classified error, or returns nil if it
 // succeeded.
+//
+// It reads the Job alone, and the Job alone cannot tell a task that failed from
+// a pod that was taken away. Execute asks the pod before a terminal answer from
+// here stands; see unlessTakenAway.
 func jobFailure(job *batchv1.Job) error {
 	if job == nil {
 		return nil
@@ -297,6 +301,66 @@ func jobFailure(job *batchv1.Job) error {
 			"the task container exited non-zero")
 	}
 	return nil
+}
+
+// unlessTakenAway turns a terminal Job failure into a retryable one when the
+// pod shows the task never failed at all: it was taken away.
+//
+// backoffLimit: 0 makes Kubernetes fail the Job for ANY pod that stops without
+// succeeding, so "the task exited 1" and "somebody drained the node" arrive as
+// the same condition, BackoffLimitExceeded. Read from the Job alone, every
+// eviction, every preemption and every `kubectl delete pod` failed its step for
+// good and blamed the tool — wrong twice over, because nothing in the tool
+// broke, and another attempt is exactly what the at-least-once contract
+// already allows.
+//
+// A retry needs POSITIVE evidence of removal. A pod that simply exited non-zero
+// stays terminal, and so does one the kernel OOM-killed, since its next attempt
+// meets the same limit. So does a failure whose pod cannot be read: guessing
+// "retryable" without evidence is how a side-effecting tool runs three times.
+func (e *Executor) unlessTakenAway(ctx context.Context, jobName string, failure error) error {
+	var te *runmesh.ToolError
+	if !errors.As(failure, &te) || te.Retryable {
+		return failure
+	}
+	pod, err := e.taskPod(ctx, jobName)
+	if err != nil {
+		e.log.Warn("could not read the pod of a failed Job; its failure stays terminal",
+			"k8s_job", jobName, "err", err)
+		return failure
+	}
+	why := takenAway(pod)
+	if why == "" {
+		return failure
+	}
+	return runmesh.Retry(runmesh.CodeWorkloadLost,
+		"the workload was taken away before it finished: %s", why)
+}
+
+// takenAway names what removed a task's pod, or returns "" when nothing did.
+//
+// A nil pod is one that no longer exists. TTL cleanup starts only once the Job
+// has finished, and this is asked the moment it has, so a pod that is already
+// gone was deleted rather than tidied away.
+func takenAway(pod *corev1.Pod) string {
+	switch {
+	case pod == nil:
+		return "its pod no longer exists"
+	case pod.DeletionTimestamp != nil:
+		return "its pod was deleted"
+	case pod.Status.Reason == "Evicted":
+		// Node-pressure eviction by the kubelet, which marks the pod Failed
+		// rather than deleting it.
+		return "its pod was evicted"
+	}
+	for _, c := range pod.Status.Conditions {
+		// Preemption, taint-based deletion, eviction through the API and pod
+		// garbage collection after a node is lost all say so here.
+		if c.Type == corev1.DisruptionTarget && c.Status == corev1.ConditionTrue {
+			return "its pod was disrupted (" + c.Reason + ")"
+		}
+	}
+	return ""
 }
 
 // collectResult reads the pod's logs and extracts the result line.
@@ -336,11 +400,20 @@ func (e *Executor) collectResult(ctx context.Context, in tools.Input, jobName st
 	return result, nil
 }
 
-// podFor finds the pod a Job created.
+// podFor finds the name of the pod a Job created, or "" if there is none.
+func (e *Executor) podFor(ctx context.Context, jobName string) (string, error) {
+	pod, err := e.taskPod(ctx, jobName)
+	if err != nil || pod == nil {
+		return "", err
+	}
+	return pod.Name, nil
+}
+
+// taskPod finds the pod a Job created, or nil if there is none.
 //
 // The selector is batch.kubernetes.io/job-name, the modern label; job-name is
 // its deprecated alias and is matched too so an older cluster still works.
-func (e *Executor) podFor(ctx context.Context, jobName string) (string, error) {
+func (e *Executor) taskPod(ctx context.Context, jobName string) (*corev1.Pod, error) {
 	for _, selector := range []string{
 		"batch.kubernetes.io/job-name=" + jobName,
 		"job-name=" + jobName,
@@ -350,14 +423,14 @@ func (e *Executor) podFor(ctx context.Context, jobName string) (string, error) {
 			Limit:         10,
 		})
 		if err != nil {
-			return "", classifyAPIError(err, "listing the Job's pods")
+			return nil, classifyAPIError(err, "listing the Job's pods")
 		}
 		if len(list.Items) > 0 {
 			// backoffLimit: 0 means at most one pod, so the first is the only.
-			return list.Items[0].Name, nil
+			return &list.Items[0], nil
 		}
 	}
-	return "", nil
+	return nil, nil
 }
 
 // deleteJob removes a Job and the pods it owns.

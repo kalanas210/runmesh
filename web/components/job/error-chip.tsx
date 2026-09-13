@@ -24,11 +24,13 @@ import type { ErrorInfo } from "@/lib/types";
  * the first kind.
  */
 
-/** internal/runmesh/errors.go:36-67, in source order, expanded into sentences. */
+/** internal/runmesh/errors.go:36-72, in source order, expanded into sentences. */
 const CODE_NOTES: Record<string, string> = {
   step_timeout: "the tool ran past this step's timeout and was cancelled",
   cancelled: "the job was cancelled before or during this step",
   lease_lost: "another worker took the step while this one was executing it",
+  workload_lost:
+    "the pod running this attempt was taken away — deleted, evicted or preempted — so it runs again",
   tool_abandoned: "the tool returned neither a result nor an error",
   tool_panic: "the tool panicked",
   engine_panic: "the runtime itself panicked while running the step",

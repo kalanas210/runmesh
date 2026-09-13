@@ -34,9 +34,14 @@ var (
 // choose their own codes; these are the ones RunMesh guarantees, which makes
 // them safe to alert on and safe to render in the dashboard.
 const (
-	CodeTimeout        = "step_timeout"
-	CodeCancelled      = "cancelled"
-	CodeLeaseLost      = "lease_lost"
+	CodeTimeout   = "step_timeout"
+	CodeCancelled = "cancelled"
+	CodeLeaseLost = "lease_lost"
+	// CodeWorkloadLost: the sandbox running the attempt was taken away rather
+	// than failing on its own — its Job deleted, or its pod deleted, evicted or
+	// preempted. Retryable: the step did not finish, and the at-least-once
+	// contract already allows it to run again.
+	CodeWorkloadLost   = "workload_lost"
 	CodeAbandoned      = "tool_abandoned"
 	CodePanic          = "tool_panic"
 	CodeEnginePanic    = "engine_panic"

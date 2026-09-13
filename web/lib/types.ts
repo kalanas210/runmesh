@@ -47,7 +47,7 @@ import type { JobState, StepState } from "./state";
  * ErrorInfo. All four members are always present when the object is non-null —
  * there is no omitempty on the Go struct.
  *
- * `code` is an OPEN string. The sixteen values in KNOWN_ERROR_CODES are the
+ * `code` is an OPEN string. The seventeen values in KNOWN_ERROR_CODES are the
  * ones the runtime guarantees; a tool may return its own, and rendering an
  * unrecognised code verbatim is better than mapping it to "unknown".
  */
@@ -58,11 +58,12 @@ export interface ErrorInfo {
   attempt: number;
 }
 
-/** internal/runmesh/errors.go:36-67. Runtime and policy codes, in source order. */
+/** internal/runmesh/errors.go:36-72. Runtime and policy codes, in source order. */
 export const KNOWN_ERROR_CODES = [
   "step_timeout",
   "cancelled",
   "lease_lost",
+  "workload_lost",
   "tool_abandoned",
   "tool_panic",
   "engine_panic",
