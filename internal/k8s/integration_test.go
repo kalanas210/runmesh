@@ -200,12 +200,12 @@ func TestIntegrationLabelsAreQueryable(t *testing.T) {
 	if job.Spec.BackoffLimit == nil || *job.Spec.BackoffLimit != 0 {
 		t.Error("the API server holds a Job whose backoffLimit is not 0")
 	}
-	// Left to TTL rather than deleted, so its logs survive for debugging.
-	t.Cleanup(func() {
-		cctx, ccancel := clock.WithWriteDeadline(context.Background(), 30*time.Second)
-		defer ccancel()
-		_ = client.BatchV1().Jobs(cfg.Namespace).Delete(cctx, job.Name, metav1.DeleteOptions{})
-	})
+	// Left to TTLAfterFinished (30s, in integrationConfig) rather than deleted,
+	// so its logs survive for debugging — and deliberately not deleted here
+	// either. A Job deleted with the API's default propagation orphans its pod,
+	// and an orphaned pod has no ttlSecondsAfterFinished to expire it: until
+	// this stopped deleting, every run left one Completed pod in the namespace
+	// for good.
 }
 
 // TestIntegrationCancellationDeletesTheWorkload. A cancelled step whose pod
