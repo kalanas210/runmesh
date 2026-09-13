@@ -117,10 +117,10 @@ func dispatch(tool string, params map[string]any, getenv func(string) string,
 			fmt.Fprintf(stderr, "task: %v\n", err)
 			return nil, 2
 		}
-		// A real sleep, and the only one in the repository outside the clock
-		// package: this process is a container with no injected clock and
-		// nothing to synchronise on. RunMesh's own deadline and the Job's
-		// activeDeadlineSeconds both bound it from outside.
+		// A real sleep, and the only one outside a test: this process is a
+		// container with no injected clock and nothing to synchronise on.
+		// RunMesh's own deadline and the Job's activeDeadlineSeconds both bound
+		// it from outside.
 		time.Sleep(d)
 		return map[string]any{"slept_ms": d.Milliseconds()}, 0
 

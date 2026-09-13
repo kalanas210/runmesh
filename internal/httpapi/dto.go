@@ -110,8 +110,8 @@ type streamSnapshot struct {
 
 // streamResync says the client's cursor predates retained history, so anything
 // it holds from before oldest_seq can never be filled in. The in-memory store's
-// event ring evicts; PostgreSQL does not, so this frame is real only under
-// RUNMESH_STORE=memory today. Telling the client beats rendering a timeline
+// event ring evicts; PostgreSQL does not, so this frame is real only on the
+// in-memory store (RUNMESH_DATABASE_URL unset) today. Telling the client beats rendering a timeline
 // with a silent hole in it.
 type streamResync struct {
 	Reason    string `json:"reason"`

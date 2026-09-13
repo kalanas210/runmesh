@@ -13,8 +13,14 @@ an eight-value semantic state palette.
 ```
 cp .env.example .env.local         # then fill in RUNMESH_API_KEY
 npm ci
-npm run dev
+npm run dev -- -H 127.0.0.1
 ```
+
+Keep the `-H 127.0.0.1`. Next.js listens on every interface by default, and the
+console has no login of its own: its proxy attaches `RUNMESH_API_KEY` to the
+requests it forwards, so anyone who can reach port 3000 can call the API with
+that key's scopes. A production build is `npm run build`, then
+`npm start -- -H 127.0.0.1`.
 
 `next dev` defaults to port 3000, which collides with Grafana's default. Check
 before assuming it is free:

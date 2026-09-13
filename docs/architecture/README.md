@@ -25,7 +25,6 @@ flowchart TB
     ORCH -->|"Observer: nine methods, no returns"| REG["internal/metrics<br/>atomics + text exposition 0.0.4"]
     ORCH --> STORE[("PostgreSQL<br/>state + SKIP LOCKED queue")]
     ORCH --> LOG["slog<br/>one line per request, per settled step"]
-    ORCH --> REDIS[("Redis<br/>rate limit + pub/sub<br/>Phase 3")]
 
     EXEC --> K8S["Kubernetes"]
     K8S --> P1["Task Job<br/>python sandbox"]
@@ -79,22 +78,29 @@ sequenceDiagram
 ```mermaid
 stateDiagram-v2
     [*] --> QUEUED
-    QUEUED --> SCHEDULED: claimed by worker
-    QUEUED --> CANCELLED: cancel requested
-    SCHEDULED --> RUNNING: execution started
-    SCHEDULED --> CANCELLED: cancel requested
-    RUNNING --> SUCCEEDED: tool returned a result
-    RUNNING --> RETRYING: retryable failure, attempts remain
-    RUNNING --> FAILED: terminal failure or attempts exhausted
-    RUNNING --> TIMED_OUT: step deadline exceeded
-    RUNNING --> CANCELLED: cancel requested
-    RETRYING --> QUEUED: backoff elapsed
-    RETRYING --> CANCELLED: cancel requested
-    TIMED_OUT --> RETRYING: retryable by policy
+    QUEUED --> SCHEDULED: claimed, lease granted
+    QUEUED --> CANCELLED: job cancelled
+    SCHEDULED --> RUNNING: tool started
+    RUNNING --> SUCCEEDED: result returned
+    RUNNING --> RETRYING: retryable failure or timeout, attempts left
+    RUNNING --> FAILED: terminal failure, or attempts used up
+    RUNNING --> TIMED_OUT: timed out on the last attempt
+    RUNNING --> QUEUED: lease expired, or released on drain
+    RUNNING --> CANCELLED: cancel delivered by heartbeat
+    RETRYING --> SCHEDULED: backoff elapsed, claimed again
+    RETRYING --> CANCELLED: job cancelled
+    note right of SCHEDULED
+        a leased step that has not started yet
+        can leave by any of RUNNING's exits
+    end note
     SUCCEEDED --> [*]
     FAILED --> [*]
+    TIMED_OUT --> [*]
     CANCELLED --> [*]
 ```
+
+The transition table itself is data in [`internal/runmesh/state.go`](../../internal/runmesh/state.go),
+and a table test walks every pair against an independently written matrix.
 
 ## Where the interesting engineering is
 

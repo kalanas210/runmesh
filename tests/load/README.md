@@ -1,18 +1,19 @@
 # Load tests
 
-Three [k6](https://k6.io) scripts, run against a RunMesh server you started
+Four [k6](https://k6.io) scripts, run against a RunMesh server you started
 yourself. They are not part of `go test`: they need a listener, they take
 minutes, and a load test that runs on every commit is a load test that gets
 deleted the first time CI is slow.
 
 | Script | Question it answers |
 | --- | --- |
+| `smoke.js` | Is everything wired up — the key's scopes, the tool, the submit, read and scrape paths — before ten minutes go into a real run? It is `make load`'s default, and its thresholds are about correctness, not capacity. |
 | `submit-throughput.js` | How many plans a second can `POST /api/v1/jobs` admit, and where does the latency curve bend? |
 | `mixed-read-write.js` | Do the dashboard's reads and an agent's writes interfere, and which side degrades first? |
 | `soak.js` | Does anything drift — goroutines, queue depth, dropped events, the heap — over a long run at a rate the server is comfortably inside? |
 
 `lib/runmesh.js` holds the shared plan shape, the request helpers and the
-custom metrics, so the three scripts measure the same thing and their numbers
+custom metrics, so every script measures the same thing and their numbers
 can be compared with each other.
 
 ## Running one

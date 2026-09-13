@@ -14,7 +14,7 @@
 # does, with four probes:
 #
 #   1. a deny-labelled pod cannot reach the internet          (default-deny works)
-#   2. a deny-labelled pod cannot resolve DNS                 (default-deny is total)
+#   2. a deny-labelled pod cannot reach a public IP either    (a pass is not DNS failing)
 #   3. an allow-labelled pod CAN reach the internet           (the grant works)
 #   4. an allow-labelled pod cannot reach a cluster-internal
 #      address                                                (the except list works)

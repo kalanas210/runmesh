@@ -1,7 +1,10 @@
 # The local Kubernetes cluster RunMesh develops and tests against.
 #
-#   kind create cluster --name runmesh --config deploy/kind/cluster.yaml
-#   kubectl apply -f deploy/kind/calico.yaml     (see deploy/kind/README.md)
+#   kind create cluster --config deploy/kind/cluster.yaml
+#   kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.28.2/manifests/calico.yaml
+#
+# deploy/kind/README.md has the whole sequence, including the script that
+# proves the NetworkPolicy is enforced.
 #
 # One decision here matters more than everything else in the file.
 

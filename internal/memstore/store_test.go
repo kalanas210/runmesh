@@ -21,10 +21,10 @@ var _ storetest.Store = (*memstore.Store)(nil)
 // compiler checks.
 var _ eventbus.Source = (*memstore.Store)(nil)
 
-// TestConformance is the whole point of internal/storetest: in Week 2,
-// internal/pgstore runs these same four lines against a Testcontainers
-// PostgreSQL, and any place where the in-memory simulation diverges from real
-// SKIP LOCKED semantics fails here rather than in production.
+// TestConformance is the whole point of internal/storetest: internal/pgstore
+// runs these same four lines against a real PostgreSQL, and any place where the
+// in-memory simulation diverges from real SKIP LOCKED semantics fails in CI
+// rather than in production.
 func TestConformance(t *testing.T) {
 	t.Parallel()
 	storetest.RunSuite(t, func(t *testing.T) storetest.Store {
