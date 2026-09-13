@@ -31,6 +31,11 @@ const (
 	// 500: nothing is broken, and no retry will help until an operator
 	// configures it.
 	CodeUnimplemented = "unimplemented"
+	// CodeUnavailable: something this request depends on is not answering
+	// usefully — today, the planning model. 503, not 500: the request was fine
+	// and so is RunMesh, and the response says whether waiting will help (a
+	// Retry-After header) or an operator has to act (none).
+	CodeUnavailable = "unavailable"
 )
 
 // APIError is the one and only non-2xx body shape. Never a bare string, never

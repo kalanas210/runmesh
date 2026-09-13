@@ -280,8 +280,8 @@ POST   /api/v1/jobs/{id}/cancel   request cancellation jobs.cancel   202 · 401 
 GET    /api/v1/jobs/{id}/events   execution timeline   jobs.read     200 · 400 · 401 · 403 · 404
 GET    /api/v1/jobs/{id}/stream   the same, live (SSE) jobs.read     200 · 400 · 401 · 403 · 404 · 429
 GET    /api/v1/tools          registry + contracts     jobs.read     200 · 401 · 403
-POST   /api/v1/plans          goal → a plan, unexecuted jobs.write   200 · 400 · 401 · 403 · 422 · 501
-POST   /api/v1/goals          goal → a submitted job   jobs.write    201 · 200 replay · 400 · 401 · 403 · 422 · 429 · 501
+POST   /api/v1/plans          goal → a plan, unexecuted jobs.write   200 · 400 · 401 · 403 · 422 · 429 · 501 · 503
+POST   /api/v1/goals          goal → a submitted job   jobs.write    201 · 200 replay · 400 · 401 · 403 · 422 · 429 · 501 · 503
 GET    /api/v1/metrics        Prometheus exposition    metrics.read  200 · 401 · 403 · 501
 GET    /api/v1/health         liveness                 —             200
 GET    /api/v1/ready          readiness                —             200 · 503

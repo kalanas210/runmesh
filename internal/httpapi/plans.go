@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
+	"time"
 
 	"github.com/kalanas210/runmesh/internal/planner"
 	"github.com/kalanas210/runmesh/internal/runmesh"
@@ -162,23 +164,15 @@ func (a *API) decodeGoal(w http.ResponseWriter, r *http.Request) (planner.Goal, 
 	}, true
 }
 
-// writePlannerError maps a planning failure onto the envelope, with the trace.
-//
-// The trace is attached even on failure, and especially on failure: it carries
-// every attempt the model made and every problem the validator found with each
-// one. Without it a refused goal is a 400 saying "the plan is not valid" about
-// a plan the caller never saw.
+// writePlannerError maps a planning failure onto a status and the envelope,
+// with the trace beside it.
 func (a *API) writePlannerError(w http.ResponseWriter, r *http.Request, err error, result planner.Result) {
 	var ve *runmesh.ValidationError
 	if errors.As(err, &ve) {
-		writeJSON(w, a.log, http.StatusUnprocessableEntity, plannerErrorEnvelope{
-			Error: APIError{
-				Code:      CodeUnprocessable,
-				Message:   "the planner could not produce a valid plan for this goal",
-				Details:   ve.Details,
-				RequestID: RequestIDFrom(r.Context()),
-			},
-			Trace: result.Trace,
+		a.writePlannerFailure(w, r, err, result, http.StatusUnprocessableEntity, APIError{
+			Code:    CodeUnprocessable,
+			Message: "the planner could not produce a valid plan for this goal",
+			Details: ve.Details,
 		})
 		return
 	}
@@ -188,12 +182,86 @@ func (a *API) writePlannerError(w http.ResponseWriter, r *http.Request, err erro
 				"by the execution policy"))
 		return
 	}
-	// Everything else is the model or the transport: rate limits, auth
-	// failures, safety blocks, timeouts. Classified by internal/gemini, mapped
-	// here, and never flattened into "internal error" — a caller that hit a
-	// rate limit should be told to retry, and one whose key is wrong should
-	// not be.
-	writeError(w, r, a.log, err)
+
+	// Everything else is the model or the transport, classified by the model's
+	// adapter, and each class is answered as what it is rather than flattened
+	// into "internal error". A caller that hit a rate limit is told when to come
+	// back; one whose goal was refused is told the request was fine and the
+	// goal was not; and a deployment whose model no longer exists says so,
+	// instead of looking like a RunMesh bug with the reason only in the log.
+	//
+	// The provider's code is stable, low-cardinality and documented as safe to
+	// show a caller, so it goes in details. The provider's message does not: it
+	// is written by somebody else, and it stays in the log.
+	var te *runmesh.ToolError
+	if !errors.As(err, &te) {
+		writeError(w, r, a.log, err)
+		return
+	}
+	details := []runmesh.Detail{{Field: "planner", Issue: te.Code}}
+	switch {
+	case errors.Is(err, planner.ErrModelRefused):
+		a.writePlannerFailure(w, r, err, result, http.StatusUnprocessableEntity, APIError{
+			Code:    CodeUnprocessable,
+			Message: "the planning model refused this goal; rephrasing it may help, repeating it will not",
+			Details: details,
+		})
+	case errors.Is(err, planner.ErrModelRateLimited):
+		w.Header().Set("Retry-After", retryAfterSeconds(te.RetryAfter))
+		a.writePlannerFailure(w, r, err, result, http.StatusTooManyRequests, APIError{
+			Code:    CodeResourceExhausted,
+			Message: "the planning model's rate limit was reached; retry after the Retry-After interval",
+			Details: details,
+		})
+	case errors.Is(err, planner.ErrModelUnusable):
+		// No Retry-After, and the absence is part of the answer: waiting does
+		// not bring back a model the provider has stopped serving.
+		a.writePlannerFailure(w, r, err, result, http.StatusServiceUnavailable, APIError{
+			Code: CodeUnavailable,
+			Message: "planning is unavailable: this deployment's model settings do not work " +
+				"(a rejected key, or a model the provider no longer serves), and no retry " +
+				"helps until an operator changes them",
+			Details: details,
+		})
+	default:
+		if te.Retryable {
+			w.Header().Set("Retry-After", retryAfterSeconds(te.RetryAfter))
+		}
+		a.writePlannerFailure(w, r, err, result, http.StatusServiceUnavailable, APIError{
+			Code:    CodeUnavailable,
+			Message: "the planning model did not produce an answer",
+			Details: details,
+		})
+	}
+}
+
+// writePlannerFailure is writeError for the planning endpoints: the same
+// envelope and the same logging rule, with the trace attached.
+//
+// The trace is attached even on failure, and especially on failure: it carries
+// every attempt the model made and every problem the validator found with each
+// one. Without it a refused goal is a 4xx about a plan the caller never saw.
+func (a *API) writePlannerFailure(w http.ResponseWriter, r *http.Request, err error,
+	result planner.Result, status int, api APIError) {
+
+	api.RequestID = RequestIDFrom(r.Context())
+	switch {
+	case status >= http.StatusInternalServerError:
+		a.log.Error("request failed", "status", status, "code", api.Code, "err", err)
+	case status == http.StatusTooManyRequests:
+		// A quota running out is worth seeing before the complaints arrive.
+		a.log.Warn("planning model rate limited", "status", status, "err", err)
+	default:
+		a.log.Debug("request rejected", "status", status, "code", api.Code, "err", err)
+	}
+	writeJSON(w, a.log, status, plannerErrorEnvelope{Error: api, Trace: result.Trace})
+}
+
+// retryAfterSeconds renders a Retry-After value in whole seconds, rounded up
+// and never zero: "Retry-After: 0" invites exactly the tight loop the header
+// exists to prevent.
+func retryAfterSeconds(d time.Duration) string {
+	return strconv.Itoa(max(int((d+time.Second-1)/time.Second), 1))
 }
 
 type plannerErrorEnvelope struct {
