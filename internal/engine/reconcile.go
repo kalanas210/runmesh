@@ -41,7 +41,9 @@ func (e *Engine) Reconcile(ctx context.Context) int {
 	rctx, cancel := clock.WithWriteDeadline(ctx, e.cfg.StoreTimeout)
 	defer cancel()
 
+	started := e.clock.Now()
 	expired, err := e.store.ExpireLeases(rctx, e.clock.Now(), e.cfg.ReconcileBatch)
+	e.obs.SweepFinished(len(expired), e.clock.Since(started), err)
 	if err != nil {
 		if ctx.Err() == nil {
 			e.log.Error("lease sweep failed", "err", err)
@@ -49,6 +51,11 @@ func (e *Engine) Reconcile(ctx context.Context) int {
 		return 0
 	}
 	for _, x := range expired {
+		// Labelled by the state the step landed in, which is the difference
+		// between a worker that was merely slow (QUEUED: it will retry) and one
+		// that has now exhausted the step's budget (FAILED). Aggregated, the two
+		// are indistinguishable and the second is the one that pages.
+		e.obs.LeaseReclaimed(x.NewState)
 		e.log.Warn("reclaimed an expired lease",
 			"job_id", x.JobID, "step_id", x.StepID, "attempt", x.Attempt,
 			"previous_owner", x.Owner, "new_state", x.NewState.String())

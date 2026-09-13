@@ -51,11 +51,17 @@ func (e *Engine) guarded(hard context.Context, log *slog.Logger, l runmesh.Lease
 
 // execute runs one attempt.
 //
-// The single select below carries all four ways a step can stop — the tool
-// returning, its deadline firing, a cancellation arriving on a heartbeat, and
-// the lease being lost — because keeping them in one place is what makes their
-// interactions reviewable. Splitting them across goroutines is how a cancelled
-// step ends up classified as a retryable failure.
+// The single select below carries four of the five ways a step can stop — the
+// tool returning, its deadline firing, a cancellation arriving on a heartbeat,
+// and the lease being lost — because keeping them in one place is what makes
+// their interactions reviewable. Splitting them across goroutines is how a
+// cancelled step ends up classified as a retryable failure.
+//
+// The fifth, StopShutdown, deliberately does not get an arm: a drain cancels
+// the hard context, so it arrives through the same path as a deadline and is
+// separated from it by Classify rather than by a branch here. Counting the arms
+// and counting the Stop values therefore gives different answers, which is why
+// this says four of five rather than four.
 func (e *Engine) execute(hard context.Context, log *slog.Logger, l runmesh.Lease) {
 	log = log.With("job_id", l.JobID, "step_id", l.StepID,
 		"attempt", l.Attempt, "tool", l.Tool)
@@ -71,6 +77,12 @@ func (e *Engine) execute(hard context.Context, log *slog.Logger, l runmesh.Lease
 		}
 		return
 	}
+	// Claimed-to-running. Under Kubernetes this span is pod pending time, and
+	// it is reported only after storeStart SUCCEEDS: an attempt that was
+	// dropped because somebody else owns the step never started, and counting
+	// it would put a zero-ish sample in the histogram every time a lease was
+	// stolen.
+	e.obs.AttemptStarted(l.Tool, started.Sub(l.ClaimedAt))
 
 	runCtx, cancel := e.clock.WithTimeout(hard, l.Timeout)
 	defer cancel()
@@ -144,6 +156,7 @@ func (e *Engine) execute(hard context.Context, log *slog.Logger, l runmesh.Lease
 				// void. ORDER MATTERS — stop is assigned before cancel() is
 				// called, so the classifier can never see a cancelled context
 				// without knowing why it was cancelled.
+				e.obs.Heartbeat(l.Tool, "lease_lost")
 				stop = StopLost
 				hbC = nil // stop renewing a lease we do not own
 				armAbandon()
@@ -152,6 +165,7 @@ func (e *Engine) execute(hard context.Context, log *slog.Logger, l runmesh.Lease
 			case err == nil && dir.Cancel && stop == StopNone:
 				// Only the FIRST cancellation decides anything. Renewal keeps
 				// running so the lease is held while the grace elapses.
+				e.obs.Heartbeat(l.Tool, "cancel")
 				stop, reason = StopCancel, dir.Reason
 				armAbandon()
 				log.Info("cancellation received", "reason", string(dir.Reason))
@@ -159,7 +173,17 @@ func (e *Engine) execute(hard context.Context, log *slog.Logger, l runmesh.Lease
 			case err != nil:
 				// A transient heartbeat failure is not fatal: the lease still
 				// has most of its TTL left and the next tick will renew it.
+				e.obs.Heartbeat(l.Tool, "error")
 				log.Warn("heartbeat failed", "err", err)
+			default:
+				// The ordinary renewal, counted so the three interesting
+				// outcomes have a denominator: "one heartbeat in ten thousand
+				// loses its lease" and "every heartbeat loses its lease" are the
+				// same numerator. A cancel REDELIVERED after stop was already
+				// set lands here too, and that is right — the round trip
+				// succeeded and the lease was extended, which is what this arm
+				// names.
+				e.obs.Heartbeat(l.Tool, "ok")
 			}
 
 		case <-expired:
@@ -217,6 +241,11 @@ func (e *Engine) invoke(ctx context.Context, log *slog.Logger, l runmesh.Lease, 
 		return
 	}
 
+	// Bracketing Execute and NOTHING else is the point of measuring here rather
+	// than in settle: the difference between this span and the attempt span is
+	// Store.Start plus the heartbeats plus the settle write, and that difference
+	// is what says whether a rising p95 is the tool or the engine.
+	toolStarted := e.clock.Now()
 	out, err := e.exec.Execute(ctx, tools.Input{
 		JobID:          l.JobID,
 		StepID:         l.StepID,
@@ -230,6 +259,7 @@ func (e *Engine) invoke(ctx context.Context, log *slog.Logger, l runmesh.Lease, 
 		Log:            log,
 		Clock:          e.clock,
 	})
+	e.obs.ToolExecuted(l.Tool, e.clock.Since(toolStarted))
 	done <- toolResult{out: out, err: err}
 }
 
@@ -250,7 +280,28 @@ func (e *Engine) settle(hard context.Context, log *slog.Logger, l runmesh.Lease,
 	if d.Error != nil && reason != "" {
 		d.Error.Message = "cancelled: " + string(reason)
 	}
+
+	// ONE outcome value, built from the decision and reported on every exit
+	// path below — the discard, the release, the two halves of a failed Finish
+	// (reclaimed, and genuinely lost), and the success. Built here rather than
+	// at each return so those five cannot disagree about what they are
+	// counting, and so adding a sixth return without a report is a visible
+	// omission rather than an invisible one.
+	settled := AttemptOutcome{
+		Tool:      l.Tool,
+		State:     d.State,
+		Stop:      stop,
+		Duration:  ended.Sub(started),
+		Discarded: d.Discard,
+		Released:  d.Release,
+		Reason:    d.Reason,
+	}
+	if d.Error != nil {
+		settled.Code = d.Error.Code
+	}
+
 	if d.Discard {
+		e.obs.AttemptSettled(settled)
 		log.Info("outcome discarded; another worker owns this step")
 		return
 	}
@@ -263,6 +314,7 @@ func (e *Engine) settle(hard context.Context, log *slog.Logger, l runmesh.Lease,
 			!errors.Is(err, runmesh.ErrLeaseLost) && !errors.Is(err, runmesh.ErrConflict) {
 			log.Error("could not release step", "err", err)
 		}
+		e.obs.AttemptSettled(settled)
 		return
 	}
 
@@ -284,12 +336,15 @@ func (e *Engine) settle(hard context.Context, log *slog.Logger, l runmesh.Lease,
 		// other error means the outcome is lost and the lease will expire, so
 		// it is worth an ERROR line.
 		if errors.Is(err, runmesh.ErrLeaseLost) || errors.Is(err, runmesh.ErrConflict) {
+			e.obs.AttemptSettled(settled)
 			log.Info("outcome rejected; step was reclaimed", "err", err)
 			return
 		}
+		e.obs.AttemptSettled(settled)
 		log.Error("could not persist outcome", "state", d.State.String(), "err", err)
 		return
 	}
+	e.obs.AttemptSettled(settled)
 	log.Debug("step settled", "state", d.State.String(),
 		"duration_ms", ended.Sub(started).Milliseconds())
 }

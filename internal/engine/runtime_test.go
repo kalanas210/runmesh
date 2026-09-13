@@ -63,6 +63,18 @@ func withExecutor(e tools.Executor) option {
 	return func(_ *engine.Config, d *engine.Deps) { d.Executor = e }
 }
 
+func withObserver(o engine.Observer) option {
+	return func(_ *engine.Config, d *engine.Deps) { d.Observer = o }
+}
+
+// withStore wraps the store the ENGINE talks to and leaves h.store — the real
+// one the test seeds and reads through — alone. A wrapper rather than a
+// replacement, so an injected fault fires on the engine's writes and not on the
+// harness's own setup, which is the same split the httpapi stream fixture uses.
+func withStore(wrap func(engine.Store) engine.Store) option {
+	return func(_ *engine.Config, d *engine.Deps) { d.Store = wrap(d.Store) }
+}
+
 func newHarness(t *testing.T, reg tools.Registry, opts ...option) *harness {
 	t.Helper()
 
@@ -1330,5 +1342,485 @@ func TestTimeoutIsNotMisreadAsAContractViolation(t *testing.T) {
 	drained := engine.Classify(engine.StopShutdown, context.Canceled, 0, 3, b)
 	if !drained.Release || drained.CountFail {
 		t.Errorf("a resolved drain = %+v, want a release that spends no budget", drained)
+	}
+}
+
+// ------------------------------------------------- the observer seam, Week 6
+
+// recordingObserver counts exactly what internal/metrics counts, using the same
+// labels, so an assertion made here is an assertion about the exporter.
+//
+// It is a mutex over maps rather than atomics, which is precisely what the
+// Observer doc forbids a PRODUCTION implementation from being — but a test
+// observer runs in a test, and being able to read a map back by label is worth
+// more here than being fast. The shipped implementation is held to the real
+// contract by TestObserveIsAllocationFree in internal/metrics.
+type recordingObserver struct {
+	mu sync.Mutex
+
+	claims      int
+	claimErrors int
+	requested   int
+	returned    int
+	dispatched  int
+	wokeOn      map[string]int
+	started     int
+	toolRuns    int
+	settled     []engine.AttemptOutcome
+	heartbeats  map[string]int
+	reclaimed   map[runmesh.State]int
+	sweeps      int
+	sweepErrors int
+	sweptTotal  int
+}
+
+func newRecordingObserver() *recordingObserver {
+	return &recordingObserver{
+		wokeOn:     map[string]int{},
+		heartbeats: map[string]int{},
+		reclaimed:  map[runmesh.State]int{},
+	}
+}
+
+func (o *recordingObserver) Claimed(requested, returned int, _ time.Duration, err error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.claims++
+	o.requested += requested
+	o.returned += returned
+	if err != nil {
+		o.claimErrors++
+	}
+}
+
+func (o *recordingObserver) Dispatched(string, time.Duration) {
+	o.mu.Lock()
+	o.dispatched++
+	o.mu.Unlock()
+}
+
+func (o *recordingObserver) DispatcherIdle(on string) {
+	o.mu.Lock()
+	o.wokeOn[on]++
+	o.mu.Unlock()
+}
+
+func (o *recordingObserver) AttemptStarted(string, time.Duration) {
+	o.mu.Lock()
+	o.started++
+	o.mu.Unlock()
+}
+
+func (o *recordingObserver) ToolExecuted(string, time.Duration) {
+	o.mu.Lock()
+	o.toolRuns++
+	o.mu.Unlock()
+}
+
+func (o *recordingObserver) AttemptSettled(out engine.AttemptOutcome) {
+	o.mu.Lock()
+	o.settled = append(o.settled, out)
+	o.mu.Unlock()
+}
+
+func (o *recordingObserver) Heartbeat(_, outcome string) {
+	o.mu.Lock()
+	o.heartbeats[outcome]++
+	o.mu.Unlock()
+}
+
+func (o *recordingObserver) LeaseReclaimed(s runmesh.State) {
+	o.mu.Lock()
+	o.reclaimed[s]++
+	o.mu.Unlock()
+}
+
+func (o *recordingObserver) SweepFinished(n int, _ time.Duration, err error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.sweeps++
+	o.sweptTotal += n
+	if err != nil {
+		o.sweepErrors++
+	}
+}
+
+func (o *recordingObserver) totalReclaimed() int {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	n := 0
+	for _, v := range o.reclaimed {
+		n += v
+	}
+	return n
+}
+
+func (o *recordingObserver) outcomes() []engine.AttemptOutcome {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]engine.AttemptOutcome(nil), o.settled...)
+}
+
+// TestLeasesExpiredMetricMatchesStats converts a drift RISK into an asserted
+// invariant.
+//
+// e.leasesExpired.Add is at one place in Reconcile and the observer call is at
+// another, a few lines apart, and both count the same event. They agree today.
+// They will stop agreeing the first time somebody adds an early return between
+// them — and nothing would fail, because a counter that is merely too low still
+// looks like a counter. This is the test that fails instead.
+func TestLeasesExpiredMetricMatchesStats(t *testing.T) {
+	t.Parallel()
+
+	obs := newRecordingObserver()
+	h := newHarness(t, tools.Registry{"echo": tools.Echo{}}, withObserver(obs))
+
+	// Three steps, claimed by a worker that then dies: exactly what a killed
+	// process leaves behind.
+	for _, id := range []string{"job_a", "job_b", "job_c"} {
+		h.submit(id, []runmesh.PlanStep{echoStep("s")}, runmesh.FailFast)
+	}
+	leases, err := h.store.Claim(t.Context(), runmesh.ClaimRequest{
+		Owner: "dead-worker", Limit: 3, LeaseTTL: time.Second, Now: h.clk.Now(),
+	})
+	if err != nil || len(leases) != 3 {
+		t.Fatalf("Claim: %v (%d leases)", err, len(leases))
+	}
+
+	h.clk.Advance(2 * time.Second)
+	if n := h.eng.Reconcile(t.Context()); n != 3 {
+		t.Fatalf("the sweep reclaimed %d leases, want 3", n)
+	}
+	// A second sweep with nothing to find: it must still be reported, or the
+	// sweep rate would be indistinguishable from a reconciler that has stopped.
+	h.eng.Reconcile(t.Context())
+
+	stats := h.eng.Stats()
+	if got, want := obs.totalReclaimed(), int(stats.LeasesExpired); got != want {
+		t.Errorf("the observer saw %d reclaimed leases, Stats() reports %d; "+
+			"the two counters have drifted", got, want)
+	}
+	if got := obs.reclaimed[runmesh.Queued]; got != 3 {
+		t.Errorf("reclaimed{new_state=QUEUED} = %d, want 3", got)
+	}
+	if obs.sweeps != 2 {
+		t.Errorf("sweeps = %d, want 2 including the one that found nothing", obs.sweeps)
+	}
+	if obs.sweepErrors != 0 {
+		t.Errorf("sweep errors = %d, want 0", obs.sweepErrors)
+	}
+	if obs.sweptTotal != 3 {
+		t.Errorf("the sweeps reported %d reclaimed leases in total, want 3", obs.sweptTotal)
+	}
+}
+
+// TestClaimErrorsMetricMatchesStats is the same invariant on the dispatcher's
+// side: e.claimErrors.Add and the observer both see the error from one Claim,
+// and they are deliberately not the same increment.
+func TestClaimErrorsMetricMatchesStats(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t, tools.Registry{"echo": tools.Echo{}}, withWorkers(2))
+	obs := newRecordingObserver()
+	fs := &faultStore{Store: h.store, failNext: 3}
+
+	eng, err := engine.New(engine.Config{
+		Owner: "test", Workers: 2, ClaimBatch: 2,
+		PollInterval:      10 * time.Millisecond,
+		LeaseTTL:          time.Second,
+		HeartbeatInterval: 100 * time.Millisecond,
+		StoreTimeout:      time.Second,
+		AbandonGrace:      200 * time.Millisecond,
+		ReconcileInterval: time.Hour,
+		ReconcileBatch:    100,
+	}, engine.Deps{
+		Store:    fs,
+		Executor: tools.Local{Registry: h.reg, MaxOutputBytes: 1 << 20, Log: quietLogger()},
+		Observer: obs,
+		// Real time, like TestDispatcherSurvivesAMisbehavingStore: this test is
+		// about counter agreement under a live dispatcher, not about deadlines.
+		Clock: clock.System(),
+		Log:   quietLogger(),
+	})
+	if err != nil {
+		t.Fatalf("engine.New: %v", err)
+	}
+
+	now := clock.System().Now()
+	for i := range 4 {
+		h.submitAt("job_"+string(rune('a'+i)), []runmesh.PlanStep{echoStep("s")}, runmesh.FailFast, now)
+	}
+	if err := eng.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	for range 4 {
+		h.await(jobFinished, "all four jobs to finish")
+	}
+
+	// Shut down FIRST, so the dispatcher is stopped and the two counters can be
+	// compared at an instant neither of them is moving. Reading them from a
+	// running dispatcher would make this test flaky for a reason that has
+	// nothing to do with the invariant it is asserting.
+	if err := eng.Shutdown(t.Context()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	stats := eng.Stats()
+	obs.mu.Lock()
+	defer obs.mu.Unlock()
+	if obs.claimErrors != int(stats.ClaimErrors) {
+		t.Errorf("the observer saw %d claim errors, Stats() reports %d; "+
+			"the two counters have drifted", obs.claimErrors, stats.ClaimErrors)
+	}
+	if obs.claimErrors < 3 {
+		t.Errorf("claim errors = %d, want at least the 3 that were injected", obs.claimErrors)
+	}
+	if obs.returned > obs.requested {
+		t.Errorf("the dispatcher was handed %d leases having asked for %d", obs.returned, obs.requested)
+	}
+	if obs.claims < obs.claimErrors {
+		t.Errorf("%d claims reported but %d of them failed", obs.claims, obs.claimErrors)
+	}
+}
+
+// TestEveryAttemptIsSettledExactlyOnce. settle has FIVE exit paths — the
+// discard, the release, the two halves of a failed Finish, and the success —
+// and every one of them reports, which is what stops
+// runmesh_step_attempts_total from quietly under-counting the outcomes nobody
+// watches.
+//
+// The subtests below are the three worth asserting here. The success path is
+// the one every other test in this file drives, so it is the one a refactor is
+// least likely to break; the other two are the ones that write NOTHING to the
+// store, which means the counter is the only trace they leave and a missing
+// report would be invisible. Of the two not covered here, the release is
+// exercised by TestDrainDeadlineReleasesWithoutSpendingBudget (through its
+// store-side effect rather than through this counter), and the reclaimed-Finish
+// arm is the same branch as the failed-Finish one below with a different
+// sentinel and a different log line.
+func TestEveryAttemptIsSettledExactlyOnce(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		run  func(*testing.T)
+	}{
+		{"a successful attempt", settledOnSuccess},
+		{"an outcome discarded because a second owner took the step", settledOnADiscard},
+		{"an outcome whose store write failed", settledWhenTheStoreWriteFails},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			tc.run(t)
+		})
+	}
+}
+
+func settledOnSuccess(t *testing.T) {
+	obs := newRecordingObserver()
+	h := newHarness(t, tools.Registry{"echo": tools.Echo{}}, withObserver(obs))
+
+	h.submit("job_ok", []runmesh.PlanStep{echoStep("a"), echoStep("b")}, runmesh.FailFast)
+	h.drainAll()
+
+	outcomes := obs.outcomes()
+	if len(outcomes) != 2 {
+		t.Fatalf("%d attempts settled, want 2", len(outcomes))
+	}
+	for _, o := range outcomes {
+		if o.Tool != "echo" {
+			t.Errorf("tool = %q, want echo", o.Tool)
+		}
+		if o.State != runmesh.Succeeded {
+			t.Errorf("state = %s, want SUCCEEDED", o.State)
+		}
+		if o.Stop != engine.StopNone {
+			t.Errorf("stop = %s, want none", o.Stop)
+		}
+		if o.Code != "" {
+			t.Errorf("code = %q, want empty for a success", o.Code)
+		}
+		if o.Discarded || o.Released {
+			t.Errorf("a successful attempt reports discarded=%v released=%v", o.Discarded, o.Released)
+		}
+		if o.Duration < 0 {
+			t.Errorf("duration = %v, want a non-negative span", o.Duration)
+		}
+	}
+
+	// The per-attempt seams fired too: every attempt that reached the tool was
+	// started and executed.
+	obs.mu.Lock()
+	defer obs.mu.Unlock()
+	if obs.started != 2 {
+		t.Errorf("attempts started = %d, want 2", obs.started)
+	}
+	if obs.toolRuns != 2 {
+		t.Errorf("tool executions = %d, want 2", obs.toolRuns)
+	}
+	// And the DISPATCHER seams did not, because drainAll drives RunOnce, which
+	// claims and executes on the calling goroutine without the dispatcher.
+	// Asserting the zero is the point: it pins that Claimed and Dispatched
+	// report the dispatcher's work and not the pool's, so a per-tool queue-wait
+	// histogram is never fed by a synchronous single-step run that had no queue
+	// to wait in.
+	if obs.dispatched != 0 {
+		t.Errorf("dispatched = %d, want 0: RunOnce bypasses the dispatcher", obs.dispatched)
+	}
+	if obs.claims != 0 {
+		t.Errorf("claims = %d, want 0: RunOnce claims directly", obs.claims)
+	}
+}
+
+// settledOnADiscard drives the one exit path that writes nothing at all.
+//
+// A second owner takes the step while the first attempt is still running; the
+// first attempt discovers it on the round trip that would have renewed its
+// lease, and settle then returns WITHOUT touching the store, because writing
+// anything there is the zombie overwrite the fencing token exists to prevent.
+// The counter is therefore the only evidence the attempt happened, and an
+// unreported discard is a step_attempts_total that undercounts by one every
+// time a lease is stolen.
+func settledOnADiscard(t *testing.T) {
+	obs := newRecordingObserver()
+	g := newGate(false)
+	h := newHarness(t, tools.Registry{"gate": g, "echo": tools.Echo{}}, withObserver(obs))
+	h.submit("job_stolen", []runmesh.PlanStep{
+		{ID: "s", Tool: "gate", TimeoutSec: 600, MaxAttempts: 3},
+	}, runmesh.FailFast)
+
+	if err := h.eng.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	h.await(stepEvent(runmesh.StepStarted, "s"), "the step to start")
+	g.waitEntered(t)
+
+	// THE STEAL IS DRIVEN THROUGH THE STORE, NOT THROUGH THE CLOCK. Advancing
+	// the fake clock far enough for this lease to expire would fire the running
+	// attempt's own heartbeat first and renew the very lease this is trying to
+	// take. ExpireLeases and Claim both take their timestamp as a parameter —
+	// the same property that lets them be SQL bind variables — so the sweep and
+	// the second claim can happen at a notional minute from now while the
+	// engine's clock has not moved at all.
+	stealAt := h.clk.Now().Add(time.Minute)
+	if _, err := h.store.ExpireLeases(t.Context(), stealAt, 10); err != nil {
+		t.Fatalf("ExpireLeases: %v", err)
+	}
+	stolen, err := h.store.Claim(t.Context(), runmesh.ClaimRequest{
+		Owner: "second-owner", Limit: 1, LeaseTTL: time.Minute, Now: stealAt,
+	})
+	if err != nil || len(stolen) != 1 {
+		t.Fatalf("the second owner claimed %d steps: %v", len(stolen), err)
+	}
+
+	// dispatcher ticker + reconciler ticker + the step's deadline + its
+	// heartbeat ticker.
+	if err := h.clk.BlockUntilContext(t.Context(), 4); err != nil {
+		t.Fatalf("waiting for the heartbeat to arm: %v", err)
+	}
+	h.clk.Advance(time.Second)
+
+	// A discard leaves no event, so there is nothing on the stream to wait for.
+	// What it does leave is a returned idle token, and with one worker a second
+	// job cannot start until the discarded attempt has settled — so the second
+	// job's completion IS the synchronisation point, on the event stream like
+	// every other wait in this file.
+	h.submit("job_after", []runmesh.PlanStep{echoStep("s")}, runmesh.FailFast)
+	h.await(func(e runmesh.Event) bool {
+		return e.JobID == "job_after" && e.Type == runmesh.JobFinished
+	}, "the next job to run on the worker the discarded attempt released")
+
+	var discards []engine.AttemptOutcome
+	for _, o := range obs.outcomes() {
+		if o.Tool == "gate" {
+			discards = append(discards, o)
+		}
+	}
+	if len(discards) != 1 {
+		t.Fatalf("the stolen attempt reported %d outcomes, want exactly 1: %+v",
+			len(discards), discards)
+	}
+	o := discards[0]
+	if !o.Discarded {
+		t.Errorf("discarded = false for an attempt whose lease was taken: %+v", o)
+	}
+	if o.Released {
+		t.Errorf("released = true on a discard; a discard writes nothing, and a "+
+			"release is a store call: %+v", o)
+	}
+	if o.Stop != engine.StopLost {
+		t.Errorf("stop = %s, want %s", o.Stop, engine.StopLost)
+	}
+	if o.Reason != runmesh.CodeLeaseLost {
+		t.Errorf("reason = %q, want %q", o.Reason, runmesh.CodeLeaseLost)
+	}
+
+	// And the store really was left to the new owner: the step is still the
+	// SCHEDULED one that owner claimed, not something the zombie overwrote.
+	if got := h.job("job_stolen").Step("s").State; got != runmesh.Scheduled {
+		t.Errorf("the stolen step is %s, want SCHEDULED: the discarded attempt "+
+			"wrote to the store after all", got)
+	}
+
+	close(g.release)
+	_ = h.eng.Shutdown(t.Context())
+}
+
+// finishFailsStore makes Finish fail with an error that is NEITHER ErrLeaseLost
+// nor ErrConflict.
+//
+// The distinction is the whole reason settle has two arms there: the sentinels
+// mean "somebody else owns this step and has written its outcome", so the
+// result is merely redundant, while anything else — a full disk, a reset
+// connection, a constraint nobody anticipated — means the outcome is GONE and
+// the lease will have to expire before the step is tried again. Different log
+// lines, the same obligation to report the attempt.
+type finishFailsStore struct {
+	engine.Store
+	err error
+}
+
+func (s finishFailsStore) Finish(context.Context, runmesh.Outcome) error { return s.err }
+
+func settledWhenTheStoreWriteFails(t *testing.T) {
+	obs := newRecordingObserver()
+	boom := errors.New("the outcome write hit a full disk")
+	h := newHarness(t, tools.Registry{"echo": tools.Echo{}}, withObserver(obs),
+		withStore(func(s engine.Store) engine.Store {
+			return finishFailsStore{Store: s, err: boom}
+		}))
+
+	h.submit("job_lost_write", []runmesh.PlanStep{echoStep("a")}, runmesh.FailFast)
+	if n := h.drainAll(); n != 1 {
+		t.Fatalf("RunOnce ran %d attempts, want 1: a step whose outcome was never "+
+			"written keeps its lease and must not be reclaimable in the same drain", n)
+	}
+
+	outcomes := obs.outcomes()
+	if len(outcomes) != 1 {
+		t.Fatalf("%d attempts settled, want 1: an outcome the store refused is "+
+			"still an attempt that ran, and the counter is the only place it shows", len(outcomes))
+	}
+	o := outcomes[0]
+	// SUCCEEDED, not a failure. The step did what it was asked; the failure is
+	// the store's, and reporting it as the step's would make a disk incident
+	// look like a wave of failing tools.
+	if o.State != runmesh.Succeeded {
+		t.Errorf("state = %s, want SUCCEEDED: the attempt succeeded and its WRITE "+
+			"failed", o.State)
+	}
+	if o.Discarded || o.Released {
+		t.Errorf("a lost outcome reports discarded=%v released=%v; it is neither — "+
+			"the write was attempted and it failed", o.Discarded, o.Released)
+	}
+	if o.Code != "" {
+		t.Errorf("code = %q, want empty: the classifier saw a successful attempt", o.Code)
+	}
+
+	// Nothing was persisted, which is what makes lease expiry the recovery path
+	// rather than anything this counter does.
+	if got := h.job("job_lost_write").Step("a").State; got != runmesh.Running {
+		t.Errorf("the step is %s, want RUNNING: the injected fault was supposed to "+
+			"lose the outcome", got)
 	}
 }

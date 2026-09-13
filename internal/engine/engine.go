@@ -133,6 +133,12 @@ type Deps struct {
 	// what every Week-1 and Week-2 test assumes and is why they did not have to
 	// change when the policy engine arrived.
 	Sandbox Sandbox
+	// Observer is optional in a test and mandatory in the server, exactly as
+	// Sandbox is. Nil means nopObserver, which is why the arrival of telemetry
+	// in Week 6 changed no existing engine test. Every method on it is called
+	// on a dispatcher or worker goroutine; see observer.go for what that
+	// obliges an implementation to be.
+	Observer Observer
 }
 
 // Engine owns the runtime goroutines.
@@ -141,6 +147,7 @@ type Engine struct {
 	store Store
 	exec  tools.Executor
 	box   Sandbox
+	obs   Observer
 	clock clock.Clock
 	log   *slog.Logger
 
@@ -188,6 +195,9 @@ func New(cfg Config, d Deps) (*Engine, error) {
 	if d.Sandbox == nil {
 		d.Sandbox = policy.Passthrough{}
 	}
+	if d.Observer == nil {
+		d.Observer = nopObserver{}
+	}
 	cfg.setDefaults()
 
 	return &Engine{
@@ -195,6 +205,7 @@ func New(cfg Config, d Deps) (*Engine, error) {
 		store:        d.Store,
 		exec:         d.Executor,
 		box:          d.Sandbox,
+		obs:          d.Observer,
 		clock:        d.Clock,
 		log:          d.Log.With("component", "engine"),
 		leases:       make(chan runmesh.Lease),
@@ -345,6 +356,17 @@ func (e *Engine) Inflight() int {
 	defer e.inflightMu.Unlock()
 	return len(e.inflight)
 }
+
+// IdleWorkers reports how much capacity the dispatcher has not yet spent.
+//
+// It is deliberately NOT Workers() minus Inflight(), and the gap between the
+// two is the interesting part. A capacity token is taken by the dispatcher
+// before it calls Claim and is not consumed until the worker takes the lease
+// off the channel, so during the claim-to-hand-off window a pool can have zero
+// idle tokens and zero steps in flight at the same instant. That window is
+// exactly the one that widens when the store is slow to claim, which is what
+// makes the two gauges worth exporting separately.
+func (e *Engine) IdleWorkers() int { return len(e.idle) }
 
 // InflightAttempts lists the attempt ids currently executing. It is what the
 // drain-incomplete log line names, so an operator can see which tool hung.

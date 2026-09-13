@@ -34,6 +34,7 @@ func (e *Engine) runDispatcher(ctx context.Context) {
 			return
 		}
 
+		claimStarted := e.clock.Now()
 		cctx, cancel := clock.WithWriteDeadline(ctx, e.cfg.StoreTimeout)
 		leases, err := e.store.Claim(cctx, runmesh.ClaimRequest{
 			Owner:    e.cfg.Owner,
@@ -43,6 +44,12 @@ func (e *Engine) runDispatcher(ctx context.Context) {
 			Tools:    e.cfg.Tools,
 		})
 		cancel()
+		// One report per round trip, placed here so both the requested and the
+		// returned count are in hand. The existing e.claimErrors.Add below is
+		// deliberately NOT duplicated into the observer: it sees the same err,
+		// and two increments of one quantity is exactly the drift that makes
+		// engine.Stats() and a dashboard disagree six months later.
+		e.obs.Claimed(held, len(leases), e.clock.Since(claimStarted), err)
 
 		if err != nil {
 			// Claim's contract says an error means NO leases. Returning every
@@ -74,6 +81,11 @@ func (e *Engine) runDispatcher(ctx context.Context) {
 			select {
 			case e.leases <- l:
 				handed++
+				// This instant is exactly when a worker took the lease — the
+				// channel is unbuffered — so now minus ClaimedAt is the time a
+				// claimed step spent waiting for capacity rather than the time
+				// it spent queued in the store.
+				e.obs.Dispatched(l.Tool, e.clock.Since(l.ClaimedAt))
 			case <-ctx.Done():
 				e.giveBack(held - handed)
 				// Give the STEPS back too, not just the tokens: a lease we
@@ -141,13 +153,21 @@ func (e *Engine) releaseLeases(ctx context.Context, leases []runmesh.Lease, reas
 // comes first. A missed hint costs one tick of latency; the ticker is the
 // backstop that makes the hint optional, which is what lets a PostgreSQL store
 // return a nil channel until LISTEN/NOTIFY exists.
+//
+// Which arm fired is reported, because the hint-to-tick ratio is the only
+// evidence that Store.Ready() is earning its keep: a ratio near zero means the
+// hint channel is carrying nothing and the poll interval is the whole of the
+// latency story, which is a configuration change rather than a code change.
 func (e *Engine) park(ctx context.Context, tick clock.Ticker) bool {
 	select {
 	case <-ctx.Done():
+		e.obs.DispatcherIdle("shutdown")
 		return false
 	case <-e.store.Ready():
+		e.obs.DispatcherIdle("hint")
 		return true
 	case <-tick.C():
+		e.obs.DispatcherIdle("tick")
 		return true
 	}
 }
