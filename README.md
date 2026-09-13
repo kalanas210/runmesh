@@ -77,6 +77,7 @@ goal ──▶ planner ──▶ validated plan ──▶ RunMesh ──▶ isol
 - **Cancellation across replicas.** Waiting steps are cancelled at once; running steps learn on their next heartbeat, and their Kubernetes Jobs are deleted.
 - **Idempotent submission** with `Idempotency-Key`, and job priorities that order the queue.
 - **Failure policies.** `fail_fast` by default, or `continue_on_failure`, which cancels only the failed step's dependents.
+- **Readable reports.** `report_generate` ends a plan with a document written for a person: an overview in sentences, values as lists, text as quotes, and JSON only for nested data. The same results always make the same report.
 
 ### Reliability
 - **PostgreSQL is the queue.** `SELECT … FOR UPDATE SKIP LOCKED` hands each ready step to exactly one worker, with no broker to operate.
@@ -545,10 +546,9 @@ The choices with real alternatives are written down as ADRs in
 ## Roadmap
 
 Done: the runtime, durable state, Kubernetes isolation, the Gemini planner,
-observability, the dashboard, recovery from crashes and lost workloads, and failure details from task containers.
+observability, the dashboard, recovery from crashes and lost workloads, failure details from task containers, and readable reports.
 Next:
 
-- [ ] **Written reports.** Have `report_generate` write a narrative summary of its inputs, not only per-step tables.
 - [ ] **Adaptive concurrency.** Size the worker pool from observed latency and errors, instead of a fixed `RUNMESH_WORKERS`.
 - [ ] **Rate limiting.** Redis-backed limits per tool and per external host, shared across replicas.
 - [ ] **Multi-node cluster.** A kind cluster with worker nodes, pod spreading, and node drain and eviction tests.

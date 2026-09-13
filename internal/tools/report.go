@@ -37,17 +37,18 @@ var (
 func (Report) Describe() Descriptor {
 	return Descriptor{
 		Name:    "report_generate",
-		Version: "1.0",
-		Description: "Renders a Markdown report from the results of the steps it depends on. " +
-			"Takes no input data of its own: put it at the end of a plan and list the " +
-			"steps whose output it should present in depends_on.",
+		Version: "2.0",
+		Description: "Writes a Markdown report from the results of the steps it depends on: " +
+			"an overview in sentences, then each result as a list, quoted text or, for " +
+			"nested data, JSON. Takes no input data of its own: put it at the end of a " +
+			"plan and list the steps whose output it should present in depends_on.",
 		InputSchema: json.RawMessage(`{
   "type": "object",
   "properties": {
     "title":   {"type": "string", "description": "Heading for the report."},
     "summary": {"type": "string", "description": "A paragraph placed under the heading."},
     "include": {"type": "array", "items": {"type": "string"}, "description": "Step ids to present, in this order. Defaults to every dependency, in id order."},
-    "raw":     {"type": "boolean", "description": "Append each step's full result as JSON. Defaults to true."}
+    "raw":     {"type": "boolean", "description": "Also append each step's full result as JSON. Defaults to false."}
   },
   "additionalProperties": false
 }`),

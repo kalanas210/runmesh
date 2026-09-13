@@ -104,29 +104,77 @@ func TestReportNamesAMissingDependencyRatherThanFailing(t *testing.T) {
 	}
 }
 
-// TestReportEscapesTableCells. A result is data from somewhere else — in the
-// general case a fetched web page, via a step a language model chose to add —
-// and a pipe or a newline in it breaks the table it lands in.
-func TestReportEscapesTableCells(t *testing.T) {
+// TestReportWritesProse. The console shows a report as plain text, so the
+// document has to read as one: an overview in sentences, values as a list, and
+// passages as quotes rather than table cells cut off at a column width.
+func TestReportWritesProse(t *testing.T) {
 	t.Parallel()
 
-	got := runReport(t, `{"raw":false}`, map[string]json.RawMessage{
-		"hostile": json.RawMessage(`{"text":"a | b\nc | d"}`),
+	long := strings.Repeat("Passengers rose every summer. ", 8)
+	got := runReport(t, `{"title":"Airline passengers"}`, map[string]json.RawMessage{
+		"analyze": json.RawMessage(`{"months":144,"trend":"increasing","notes":"` + long + `"}`),
+		"fetch":   json.RawMessage(`["1949-01","1949-02"]`),
+	})
+	md := got["markdown"].(string)
+
+	for _, want := range []string{
+		"## Overview",
+		"This report covers 2 steps: `analyze` and `fetch`.",
+		"`analyze` returned 3 fields.",
+		"`fetch` returned a list of 2 items.",
+		"- `months`: 144",
+		"- `trend`: increasing",
+		"### `notes`",
+		"> Passengers rose every summer.",
+		"- 1949-01",
+	} {
+		if !strings.Contains(md, want) {
+			t.Errorf("the report does not contain %q:\n%s", want, md)
+		}
+	}
+	if strings.Contains(md, "```") {
+		t.Errorf("flat data was rendered as JSON with raw off:\n%s", md)
+	}
+}
+
+// TestReportAppendsTheFullResultOnRequest. The data a debugger needs is one
+// flag away, and off by default because the sections are written for a reader.
+func TestReportAppendsTheFullResultOnRequest(t *testing.T) {
+	t.Parallel()
+
+	deps := map[string]json.RawMessage{"analyze": json.RawMessage(`{"rows":42}`)}
+	if md := runReport(t, `{}`, deps)["markdown"].(string); strings.Contains(md, "```json") {
+		t.Errorf("raw defaults to off, but the JSON was appended:\n%s", md)
+	}
+	md := runReport(t, `{"raw":true}`, deps)["markdown"].(string)
+	if !strings.Contains(md, "The full result:") || !strings.Contains(md, `"rows": 42`) {
+		t.Errorf("raw:true did not append the full result:\n%s", md)
+	}
+}
+
+// TestReportKeepsDataInsideItsBlocks. A result is data from somewhere else — in
+// the general case a fetched web page, via a step a language model chose to
+// add — and a line of it that reads like Markdown must not become the report's
+// own structure: no heading of its own, and no fence it can close early.
+func TestReportKeepsDataInsideItsBlocks(t *testing.T) {
+	t.Parallel()
+
+	got := runReport(t, `{}`, map[string]json.RawMessage{
+		"page":   json.RawMessage(`"intro\n## Injected heading\n` + "```" + `\nafter"`),
+		"nested": json.RawMessage(`{"rows":[{"note":"` + "```" + `"}]}`),
 	})
 	md := got["markdown"].(string)
 
 	for _, line := range strings.Split(md, "\n") {
-		if !strings.HasPrefix(line, "| `text`") {
-			continue
-		}
-		// Two structural pipes at the ends plus one separator; every pipe from
-		// the data must be escaped.
-		if strings.Count(line, "|")-strings.Count(line, "\\|") != 3 {
-			t.Errorf("the data's pipes were not escaped: %q", line)
+		if line == "## Injected heading" {
+			t.Fatalf("a line of data became a heading of the report:\n%s", md)
 		}
 	}
-	if strings.Count(md, "\n\nc | d") > 0 {
-		t.Errorf("a newline from the data broke out of its cell:\n%s", md)
+	if !strings.Contains(md, "> ## Injected heading") {
+		t.Errorf("the text was not quoted:\n%s", md)
+	}
+	if !strings.Contains(md, "````json") {
+		t.Errorf("data containing ``` was fenced with a fence it can close:\n%s", md)
 	}
 }
 
