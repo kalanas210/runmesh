@@ -230,6 +230,13 @@ func BuildJob(cfg Config, in tools.Input, owner string) (*batchv1.Job, error) {
 						// does not care either way.
 						ImagePullPolicy: corev1.PullIfNotPresent,
 
+						// Nothing in a task image writes a termination message,
+						// so when a task fails the kubelet keeps the END of its
+						// log in the container status instead: at most 80 lines
+						// or 2 KiB. Execute copies that into the step's error,
+						// which is how the reason a task failed outlives its pod.
+						TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
+
 						SecurityContext: &corev1.SecurityContext{
 							RunAsNonRoot: ptrTo(true),
 							RunAsUser:    ptrTo(runAsUser(cfg.RunAsUser)),

@@ -189,7 +189,7 @@ func TestExecuteClassifiesFailures(t *testing.T) {
 			name:      "the task exited non-zero",
 			status:    backoff,
 			pod:       podOf(job, nil),
-			wantCode:  runmesh.CodeContractBroken,
+			wantCode:  runmesh.CodeTaskExited,
 			wantRetry: false,
 			description: "terminal by default, the same rule the in-process executor " +
 				"applies to an unclassified tool error",
@@ -207,7 +207,7 @@ func TestExecuteClassifiesFailures(t *testing.T) {
 			name:      "failed with no condition yet",
 			status:    batchv1.JobStatus{Failed: 1},
 			pod:       podOf(job, nil),
-			wantCode:  runmesh.CodeContractBroken,
+			wantCode:  runmesh.CodeTaskExited,
 			wantRetry: false,
 		},
 		{
@@ -217,10 +217,21 @@ func TestExecuteClassifiesFailures(t *testing.T) {
 				p.Status.ContainerStatuses[0].State.Terminated.ExitCode = 137
 				p.Status.ContainerStatuses[0].State.Terminated.Reason = "OOMKilled"
 			}),
-			wantCode:  runmesh.CodeContractBroken,
+			wantCode:  runmesh.CodeTaskOOMKilled,
 			wantRetry: false,
 			description: "the memory limit is the operator's grant, and another attempt " +
 				"meets exactly the same one",
+		},
+		{
+			name:   "its pod recorded no exit",
+			status: backoff,
+			pod: podOf(job, func(p *corev1.Pod) {
+				p.Status.ContainerStatuses = nil
+			}),
+			wantCode:  runmesh.CodeContractBroken,
+			wantRetry: false,
+			description: "with nothing to explain the failure, the Job's own verdict " +
+				"stands, and stays terminal",
 		},
 		{
 			name:   "its pod was deleted",

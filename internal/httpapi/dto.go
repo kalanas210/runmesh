@@ -63,10 +63,19 @@ type stepResponse struct {
 }
 
 type errorInfo struct {
-	Code      string `json:"code"`
-	Message   string `json:"message"`
-	Retryable bool   `json:"retryable"`
-	Attempt   int    `json:"attempt"`
+	Code      string    `json:"code"`
+	Message   string    `json:"message"`
+	Retryable bool      `json:"retryable"`
+	Attempt   int       `json:"attempt"`
+	Exit      *exitInfo `json:"exit,omitempty"`
+}
+
+// exitInfo is runmesh.ExitInfo on the wire: how a sandboxed task's container
+// stopped, present only when that is what failed.
+type exitInfo struct {
+	Code    int32  `json:"code"`
+	Reason  string `json:"reason,omitempty"`
+	LogTail string `json:"log_tail,omitempty"`
 }
 
 type jobListResponse struct {
@@ -158,7 +167,11 @@ func toErrorInfo(e *runmesh.ErrorInfo) *errorInfo {
 	if e == nil {
 		return nil
 	}
-	return &errorInfo{Code: e.Code, Message: e.Message, Retryable: e.Retryable, Attempt: e.Attempt}
+	out := &errorInfo{Code: e.Code, Message: e.Message, Retryable: e.Retryable, Attempt: e.Attempt}
+	if e.Exit != nil {
+		out.Exit = &exitInfo{Code: e.Exit.Code, Reason: e.Exit.Reason, LogTail: e.Exit.LogTail}
+	}
+	return out
 }
 
 func toJobResponse(j *runmesh.Job) jobResponse {

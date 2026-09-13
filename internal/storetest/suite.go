@@ -106,6 +106,7 @@ func RunSuite(t *testing.T, newStore Factory) {
 		{"ListJobsPaging", testListJobsPaging},
 		{"ListJobsIncludesSteps", testListJobsIncludesSteps},
 		{"ClosedStoreRejectsEverything", testClosedStoreRejectsEverything},
+		{"ErrorExitRoundTrips", testErrorExitRoundTrips},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()

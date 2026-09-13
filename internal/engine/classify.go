@@ -115,6 +115,7 @@ func Classify(stop Stop, err error, failures, maxAttempts int, b Backoff) Dispos
 		info := &runmesh.ErrorInfo{
 			Code: te.Code, Message: te.Message,
 			Retryable: te.Retryable, Attempt: failures + 1,
+			Exit: te.Exit,
 		}
 		if te.Retryable && failures+1 < maxAttempts {
 			d := b.Delay(failures)

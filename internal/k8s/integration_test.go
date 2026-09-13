@@ -154,6 +154,21 @@ func TestIntegrationClassifiesARealFailure(t *testing.T) {
 	if te.Retryable {
 		t.Errorf("a container that exited non-zero was classified retryable: %v", te)
 	}
+
+	// And it says how: the exit code, and the end of what the task printed, read
+	// back from the kubelet rather than from logs the Job's TTL will delete.
+	if te.Code != runmesh.CodeTaskExited {
+		t.Errorf("code = %q, want %q", te.Code, runmesh.CodeTaskExited)
+	}
+	if te.Exit == nil {
+		t.Fatal("the failure carries no exit details")
+	}
+	if te.Exit.Code != 1 {
+		t.Errorf("exit code = %d, want 1", te.Exit.Code)
+	}
+	if !strings.Contains(te.Exit.LogTail, "failing attempt 1 of 5 on purpose") {
+		t.Errorf("log tail = %q, want the task's own last words", te.Exit.LogTail)
+	}
 }
 
 // TestIntegrationLabelsAreQueryable proves the identity story end to end: the

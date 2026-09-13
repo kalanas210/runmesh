@@ -193,7 +193,7 @@ func (e *Executor) Execute(ctx context.Context, in tools.Input) (tools.Output, e
 	result, logErr := e.collectResult(ctx, in, name)
 
 	if failure := jobFailure(job); failure != nil {
-		return tools.Output{}, e.unlessTakenAway(ctx, name, failure)
+		return tools.Output{}, e.explainFailure(ctx, name, failure)
 	}
 	if logErr != nil {
 		return tools.Output{}, logErr
@@ -271,7 +271,7 @@ func terminal(job *batchv1.Job) bool {
 //
 // It reads the Job alone, and the Job alone cannot tell a task that failed from
 // a pod that was taken away. Execute asks the pod before a terminal answer from
-// here stands; see unlessTakenAway.
+// here stands; see explainFailure.
 func jobFailure(job *batchv1.Job) error {
 	if job == nil {
 		return nil
@@ -303,22 +303,24 @@ func jobFailure(job *batchv1.Job) error {
 	return nil
 }
 
-// unlessTakenAway turns a terminal Job failure into a retryable one when the
-// pod shows the task never failed at all: it was taken away.
+// explainFailure asks the pod what a terminal Job failure really was.
 //
 // backoffLimit: 0 makes Kubernetes fail the Job for ANY pod that stops without
-// succeeding, so "the task exited 1" and "somebody drained the node" arrive as
-// the same condition, BackoffLimitExceeded. Read from the Job alone, every
-// eviction, every preemption and every `kubectl delete pod` failed its step for
-// good and blamed the tool — wrong twice over, because nothing in the tool
-// broke, and another attempt is exactly what the at-least-once contract
-// already allows.
+// succeeding, so "the task exited 1", "the kernel OOM-killed it" and "somebody
+// drained the node" all arrive as the same condition, BackoffLimitExceeded.
+// Read from the Job alone, every eviction, every preemption and every
+// `kubectl delete pod` failed its step for good and blamed the tool, and every
+// genuine failure said nothing more useful than the Job's reason.
 //
-// A retry needs POSITIVE evidence of removal. A pod that simply exited non-zero
-// stays terminal, and so does one the kernel OOM-killed, since its next attempt
-// meets the same limit. So does a failure whose pod cannot be read: guessing
-// "retryable" without evidence is how a side-effecting tool runs three times.
-func (e *Executor) unlessTakenAway(ctx context.Context, jobName string, failure error) error {
+// So the pod decides. POSITIVE evidence of removal makes the failure a
+// retryable workload_lost, since nothing in the tool broke and another attempt
+// is exactly what the at-least-once contract already allows. Otherwise the
+// container's own exit becomes task_exited or task_oom_killed, carrying the
+// exit code, the kubelet's reason and the end of the log; see containerExit. A
+// pod that cannot be read, or that recorded no exit, leaves the Job's verdict
+// standing: guessing "retryable" without evidence is how a side-effecting tool
+// runs three times.
+func (e *Executor) explainFailure(ctx context.Context, jobName string, failure error) error {
 	var te *runmesh.ToolError
 	if !errors.As(failure, &te) || te.Retryable {
 		return failure
@@ -329,12 +331,14 @@ func (e *Executor) unlessTakenAway(ctx context.Context, jobName string, failure 
 			"k8s_job", jobName, "err", err)
 		return failure
 	}
-	why := takenAway(pod)
-	if why == "" {
-		return failure
+	if why := takenAway(pod); why != "" {
+		return runmesh.Retry(runmesh.CodeWorkloadLost,
+			"the workload was taken away before it finished: %s", why)
 	}
-	return runmesh.Retry(runmesh.CodeWorkloadLost,
-		"the workload was taken away before it finished: %s", why)
+	if exited := containerExit(pod); exited != nil {
+		return exited
+	}
+	return failure
 }
 
 // takenAway names what removed a task's pod, or returns "" when nothing did.

@@ -44,18 +44,29 @@
 import type { JobState, StepState } from "./state";
 
 /**
- * ErrorInfo. All four members are always present when the object is non-null —
- * there is no omitempty on the Go struct.
+ * ErrorInfo. The four scalar members are always present when the object is
+ * non-null. `exit` is omitted (omitempty) unless a sandboxed task's container
+ * stopped badly.
  *
- * `code` is an OPEN string. The seventeen values in KNOWN_ERROR_CODES are the
- * ones the runtime guarantees; a tool may return its own, and rendering an
- * unrecognised code verbatim is better than mapping it to "unknown".
+ * `code` is an OPEN string. The values in KNOWN_ERROR_CODES are the ones the
+ * runtime guarantees; a tool may return its own, and rendering an unrecognised
+ * code verbatim is better than mapping it to "unknown".
  */
 export interface ErrorInfo {
   code: string;
   message: string;
   retryable: boolean;
   attempt: number;
+  exit?: ExitInfo;
+}
+
+/** internal/runmesh/errors.go ExitInfo: how a task container stopped. */
+export interface ExitInfo {
+  code: number;
+  /** The kubelet's word for it: Error, OOMKilled, ContainerCannotRun. */
+  reason?: string;
+  /** The end of the container's output, at most 80 lines or 2 KiB. */
+  log_tail?: string;
 }
 
 /** internal/runmesh/errors.go:36-72. Runtime and policy codes, in source order. */
@@ -73,6 +84,8 @@ export const KNOWN_ERROR_CODES = [
   "output_too_large",
   "dependency_failed",
   "shutdown_drain",
+  "task_exited",
+  "task_oom_killed",
   "tool_denied",
   "tool_not_sandboxed",
   "network_denied",

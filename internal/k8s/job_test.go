@@ -172,6 +172,12 @@ func TestBuildJobPassesTheContainerContract(t *testing.T) {
 	if c.Image != in.Limits.Image {
 		t.Errorf("image = %q, want the tool's own %q", c.Image, in.Limits.Image)
 	}
+	// Without it a failed task leaves nothing in its container status, and the
+	// step's error cannot say why it failed once the pod is reclaimed.
+	if c.TerminationMessagePolicy != corev1.TerminationMessageFallbackToLogsOnError {
+		t.Errorf("terminationMessagePolicy = %q, want %q", c.TerminationMessagePolicy,
+			corev1.TerminationMessageFallbackToLogsOnError)
+	}
 }
 
 // TestBuildJobDeniesTheAPIServerToTasks: the default is to mount a

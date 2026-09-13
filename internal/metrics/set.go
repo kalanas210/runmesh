@@ -153,7 +153,7 @@ var (
 	// this whole vocabulary, and exactly what "other" exists for.
 	errorCodes = []string{
 		runmesh.CodeTimeout, runmesh.CodeCancelled, runmesh.CodeLeaseLost,
-		runmesh.CodeWorkloadLost,
+		runmesh.CodeWorkloadLost, runmesh.CodeTaskExited, runmesh.CodeTaskOOMKilled,
 		runmesh.CodeAbandoned, runmesh.CodePanic, runmesh.CodeEnginePanic,
 		runmesh.CodeUnclassified, runmesh.CodeContractBroken, runmesh.CodeToolUnknown,
 		runmesh.CodeOutputTooLarge, runmesh.CodeDepFailed, runmesh.CodeShutdown,

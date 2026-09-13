@@ -52,6 +52,18 @@ const (
 	CodeDepFailed      = "dependency_failed"
 	CodeShutdown       = "shutdown_drain"
 
+	// A sandboxed task's container stopped on its own, and badly. Both are
+	// terminal, and both carry an ExitInfo saying how.
+	//
+	// CodeTaskExited: the container exited non-zero. The next attempt would run
+	// the same code against the same input, and under the at-least-once
+	// contract a failure nobody understood is not something to repeat.
+	CodeTaskExited = "task_exited"
+	// CodeTaskOOMKilled: the kernel killed the container at its memory limit.
+	// The limit is the operator's grant, and the next attempt meets exactly the
+	// same one.
+	CodeTaskOOMKilled = "task_oom_killed"
+
 	// The execution policy's own codes. They are terminal by construction: no
 	// number of retries turns a refusal by policy into permission, and a step
 	// that keeps retrying one hides the misconfiguration that caused it.
@@ -83,7 +95,10 @@ type ToolError struct {
 	// computed backoff but is still capped by Backoff.Max, so a hostile
 	// upstream cannot park a step for a week.
 	RetryAfter time.Duration
-	Err        error
+	// Exit is how a sandboxed task's container stopped, when that is what
+	// failed. engine.Classify carries it into the persisted ErrorInfo.
+	Exit *ExitInfo
+	Err  error
 }
 
 func (e *ToolError) Error() string { return e.Code + ": " + e.Message }
@@ -119,13 +134,37 @@ type ErrorInfo struct {
 	Message   string `json:"message"`
 	Retryable bool   `json:"retryable"`
 	Attempt   int    `json:"attempt"`
+	// Exit is set only when a sandboxed task's container stopped badly: nil for
+	// every other failure, and for every in-process tool.
+	Exit *ExitInfo `json:"exit,omitempty"`
 }
 
+// ExitInfo is what Kubernetes recorded about a task container that stopped:
+// the facts an operator would otherwise need `kubectl describe pod` and
+// `kubectl logs` for, both of which are gone once the Job's TTL reclaims it.
+type ExitInfo struct {
+	// Code is the container's exit code. 137 is SIGKILL, which is also what an
+	// OOM kill looks like from inside the container.
+	Code int32 `json:"code"`
+	// Reason is the kubelet's word for it: Error, OOMKilled, ContainerCannotRun.
+	Reason string `json:"reason,omitempty"`
+	// LogTail is the end of the container's output, as the kubelet kept it.
+	// It is whatever the task printed, so a tool must not print secrets: the
+	// rule its result line already lives under.
+	LogTail string `json:"log_tail,omitempty"`
+}
+
+// Clone returns a copy that shares no memory with e, so a delivered event can
+// never alias a stored step's error.
 func (e *ErrorInfo) Clone() *ErrorInfo {
 	if e == nil {
 		return nil
 	}
 	c := *e
+	if e.Exit != nil {
+		exit := *e.Exit
+		c.Exit = &exit
+	}
 	return &c
 }
 

@@ -98,6 +98,7 @@ goal ──▶ planner ──▶ validated plan ──▶ RunMesh ──▶ isol
 - **Execution timeline.** Every state change is an event, with a gap-free sequence number per job.
 - **Live stream** over Server-Sent Events: resumable with `Last-Event-ID`, and with PostgreSQL any replica can serve any job's stream.
 - **Prometheus metrics** from a hand-written client with closed label vocabularies, so the number of series is bounded and a test holds it under budget.
+- **Failure details.** When a task's container fails, the step's error keeps its exit code, the kubelet's reason (such as `OOMKilled`) and the end of its output, so the cause outlives the pod.
 - **Grafana dashboard** provisioned as code, and structured JSON logs.
 
 ### Dashboard
@@ -213,7 +214,7 @@ simply not claimable, so nothing has to remember to unblock it.
 | Situation | What RunMesh does |
 |---|---|
 | A tool returns a retryable error | `RETRYING`, with exponential backoff and jitter, until its attempts are spent |
-| A tool fails for good, or its container exits non-zero | `FAILED`; under `fail_fast` the rest of the job is cancelled, under `continue_on_failure` only its dependents |
+| A tool fails for good, or its container exits non-zero or runs out of memory | `FAILED`, and a container failure says how: `task_exited` or `task_oom_killed`, with the exit code and the end of its log. Under `fail_fast` the rest of the job is cancelled, under `continue_on_failure` only its dependents |
 | A step runs past its timeout | Retried while attempts remain, then `TIMED_OUT` |
 | Its pod is deleted, evicted or preempted, or its Job disappears | Retryable `workload_lost`: a fresh attempt in a fresh pod |
 | The RunMesh process crashes | Its leases expire, the reconciler requeues the steps as failed attempts, and another replica or the restarted process finishes them (with PostgreSQL) |
@@ -432,10 +433,10 @@ environment variable, validated at boot and documented in
 | Suite | What it proves | Size |
 |---|---|---|
 | Unit and component tests | Domain rules, scheduling, policy, planner, API, metrics, and the Kubernetes executor against a fake cluster | 312 tests, 656 with subtests |
-| Store conformance | The in-memory and PostgreSQL stores pass the same cases, including 32 concurrent claimers that must never share a step | 35 cases × both stores |
+| Store conformance | The in-memory and PostgreSQL stores pass the same cases, including 32 concurrent claimers that must never share a step | 36 cases × both stores |
 | Crash recovery | A real server process is killed mid-step, and another server finishes the job | real PostgreSQL |
 | Failure scenarios | An orphaned lease is recovered, lease expiry spends retry budget, a cancel reaches every dependent, a full queue answers `429` | 4 scenarios × both stores |
-| Kubernetes integration | A step runs in a real pod, a real failure is classified, cancellation deletes the workload, a deleted pod is retried, and the RBAC Role refuses what it should | 6 tests on kind |
+| Kubernetes integration | A step runs in a real pod, a real failure is classified with its exit code and log tail, cancellation deletes the workload, a deleted pod is retried, and the RBAC Role refuses what it should | 6 tests on kind |
 | NetworkPolicy probes | Denied pods reach nothing; allowed pods reach the internet but not the cluster API | 4 live probes |
 | Dashboard | Waterfall geometry, the event feed, stream parsing, the proxy's origin guard | 280 tests (Vitest) |
 | Load | Smoke, sustained submissions, mixed reads and writes, and a soak; thresholds fail the run | 4 k6 scripts |
@@ -544,10 +545,9 @@ The choices with real alternatives are written down as ADRs in
 ## Roadmap
 
 Done: the runtime, durable state, Kubernetes isolation, the Gemini planner,
-observability, the dashboard, and recovery from crashes and lost workloads.
+observability, the dashboard, recovery from crashes and lost workloads, and failure details from task containers.
 Next:
 
-- [ ] **Failure details in step errors.** Record a failed container's exit code, termination reason (such as `OOMKilled`) and the end of its log, instead of a generic `tool_broke_contract`.
 - [ ] **Written reports.** Have `report_generate` write a narrative summary of its inputs, not only per-step tables.
 - [ ] **Adaptive concurrency.** Size the worker pool from observed latency and errors, instead of a fixed `RUNMESH_WORKERS`.
 - [ ] **Rate limiting.** Redis-backed limits per tool and per external host, shared across replicas.
